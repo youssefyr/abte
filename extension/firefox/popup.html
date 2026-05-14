@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>abte</title>
+  <style>
+    :root {
+      --bg:        #0f1512;
+      --surface:   #161d1a;
+      --surface-2: #1c2520;
+      --border:    #253028;
+      --text:      #d4ede6;
+      --muted:     #6b8f80;
+      --faint:     #3d5248;
+      --accent:    #3ecf8e;
+      --accent-dim:#1a4d35;
+      --red:       #f87171;
+      --red-dim:   #3d1e1e;
+      --amber:     #fbbf24;
+      --font:      "Segoe UI","Inter","Noto Sans",system-ui,sans-serif;
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 13px;
+      width: 280px;
+      padding: 0 0 8px;
+      min-height: 320px;
+    }
+
+    /* ── Header ── */
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 14px 10px;
+      border-bottom: 1px solid var(--border);
+    }
+    .logo-mark {
+      width: 28px; height: 28px; border-radius: 7px;
+      background: var(--accent-dim);
+      display: flex; align-items: center; justify-content: center;
+      flex-shrink: 0;
+    }
+    .logo-mark svg { color: var(--accent); }
+    .header-title { font-weight: 700; font-size: 14px; letter-spacing: 0.01em; }
+    .header-sub   { font-size: 11px; color: var(--muted); margin-top: 1px; }
+    .conn-dot {
+      width: 8px; height: 8px; border-radius: 999px;
+      background: var(--faint); margin-left: auto; flex-shrink: 0;
+      transition: background 200ms;
+    }
+    .conn-dot.ok   { background: var(--accent); box-shadow: 0 0 6px var(--accent-dim); }
+    .conn-dot.warn { background: var(--amber); }
+
+    /* ── Section ── */
+    .section { padding: 10px 14px; border-bottom: 1px solid var(--border); }
+    .section-label {
+      font-size: 10px; font-weight: 600; letter-spacing: 0.08em;
+      text-transform: uppercase; color: var(--muted); margin-bottom: 8px;
+    }
+
+    /* ── Task card ── */
+    .task-card {
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 9px 11px;
+      display: flex; align-items: flex-start; gap: 8px;
+    }
+    .task-icon { color: var(--accent); flex-shrink: 0; margin-top: 1px; }
+    .task-name { font-size: 12px; font-weight: 500; color: var(--text); word-break: break-word; }
+    .task-sub  { font-size: 11px; color: var(--muted); margin-top: 2px; }
+    .no-task   { font-size: 12px; color: var(--faint); font-style: italic; }
+
+    /* ── Current tab row ── */
+    .tab-row {
+      display: flex; align-items: center; gap: 8px;
+    }
+    .tab-favicon {
+      width: 14px; height: 14px; border-radius: 3px;
+      background: var(--surface-2); flex-shrink: 0;
+      object-fit: contain;
+    }
+    .tab-title {
+      font-size: 12px; color: var(--text);
+      flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .relevance-pill {
+      font-size: 10px; font-weight: 700; padding: 2px 7px;
+      border-radius: 999px; flex-shrink: 0; line-height: 1.5;
+    }
+    .relevance-pill.relevant  { background: var(--accent-dim); color: var(--accent); }
+    .relevance-pill.offtask   { background: var(--red-dim);    color: var(--red); }
+    .relevance-pill.unknown   { background: var(--surface-2);  color: var(--faint); }
+
+    /* ── Stats row ── */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+    }
+    .stat-box {
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      padding: 8px 10px;
+    }
+    .stat-val  { font-size: 18px; font-weight: 700; color: var(--text); line-height: 1; }
+    .stat-val.accent { color: var(--accent); }
+    .stat-val.warn   { color: var(--amber); }
+    .stat-val.danger { color: var(--red); }
+    .stat-label { font-size: 10px; color: var(--muted); margin-top: 3px; }
+
+    /* ── Host pill ── */
+    .host-row { display: flex; align-items: center; gap: 6px; }
+    .host-name {
+      font-size: 12px; color: var(--muted);
+      flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .override-pill {
+      font-size: 10px; font-weight: 700; padding: 2px 7px;
+      border-radius: 999px; flex-shrink: 0; line-height: 1.5;
+    }
+    .override-pill.blocked    { background: var(--red-dim);    color: var(--red); }
+    .override-pill.whitelisted{ background: var(--accent-dim); color: var(--accent); }
+    .override-pill.auto       { background: var(--surface-2);  color: var(--faint); }
+
+    /* ── Buttons ── */
+    .btn-row { display: flex; gap: 6px; margin-top: 8px; }
+    .btn {
+      flex: 1; border: 1px solid var(--border); background: var(--surface-2);
+      padding: 7px 8px; border-radius: 7px; font-weight: 600; cursor: pointer;
+      font-size: 12px; color: var(--text); transition: background 120ms, border-color 120ms;
+      font-family: var(--font);
+    }
+    .btn:hover  { background: var(--surface); border-color: var(--muted); }
+    .btn.danger { border-color: #7f2e2e; color: var(--red); background: var(--red-dim); }
+    .btn.danger:hover { background: #4a1a1a; }
+    .btn.success{ border-color: var(--accent-dim); color: var(--accent); background: #0f2b1d; }
+    .btn.success:hover{ background: var(--accent-dim); }
+    .btn.muted  { color: var(--muted); font-weight: 500; }
+    .btn.muted:hover { color: var(--text); }
+    .btn.full   { flex: unset; width: 100%; margin-top: 6px; }
+
+    /* ── Error bar ── */
+    .error-bar {
+      background: var(--red-dim); border-top: 1px solid #7f2e2e;
+      color: var(--red); font-size: 11px; padding: 6px 14px;
+      display: none;
+    }
+    .error-bar.visible { display: block; }
+  </style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <div class="logo-mark">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <circle cx="12" cy="12" r="10"/>
+      <polyline points="12 6 12 12 16 14"/>
+    </svg>
+  </div>
+  <div>
+    <div class="header-title">abte</div>
+    <div class="header-sub" id="connText">Connecting…</div>
+  </div>
+  <div class="conn-dot" id="connDot"></div>
+</div>
+
+<!-- Active session task -->
+<div class="section">
+  <div class="section-label">Active Task</div>
+  <div class="task-card" id="taskCard">
+    <svg class="task-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
+    </svg>
+    <div>
+      <div class="task-name" id="taskName"><span class="no-task">No active session</span></div>
+      <div class="task-sub" id="taskSub"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Current tab -->
+<div class="section">
+  <div class="section-label">Current Tab</div>
+  <div class="tab-row">
+    <img class="tab-favicon" id="tabFavicon" src="" alt=""/>
+    <span class="tab-title" id="tabTitle">—</span>
+    <span class="relevance-pill unknown" id="relevancePill">—</span>
+  </div>
+</div>
+
+<!-- Stats -->
+<div class="section">
+  <div class="section-label">Session Stats</div>
+  <div class="stats-grid">
+    <div class="stat-box">
+      <div class="stat-val accent" id="statSwitches">0</div>
+      <div class="stat-label">Tab switches (5m)</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-val" id="statLastAck">—</div>
+      <div class="stat-label">Last sync</div>
+    </div>
+  </div>
+</div>
+
+<!-- Tab override controls -->
+<div class="section">
+  <div class="section-label">This Tab</div>
+  <div class="host-row">
+    <span class="host-name" id="hostName">—</span>
+    <span class="override-pill auto" id="overridePill">auto</span>
+  </div>
+  <div class="btn-row">
+    <button class="btn danger"  id="blockBtn">Block tab</button>
+    <button class="btn success" id="whitelistBtn">Whitelist tab</button>
+  </div>
+  <button class="btn muted full" id="clearBtn" style="display:none">Clear override</button>
+</div>
+
+<!-- Refresh -->
+<div style="padding: 8px 14px 4px">
+  <button class="btn muted full" id="refreshBtn">↻ Refresh</button>
+</div>
+
+<!-- Error bar -->
+<div class="error-bar" id="errorBar"></div>
+
+<script src="popup.js"></script>
+</body>
+</html>

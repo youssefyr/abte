@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "abte Bridge",
+  "version": "0.2.0",
+  "description": "Secure focus assistant bridge for abte (Chrome).",
+  "permissions": [
+    "tabs",
+    "activeTab",
+    "nativeMessaging",
+    "storage",
+    "scripting"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "abte",
+    "default_popup": "popup.html"
+  }
+}
