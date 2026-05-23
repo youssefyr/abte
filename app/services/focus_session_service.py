@@ -4,7 +4,7 @@ import logging
 from dataclasses import replace
 from datetime import datetime
 import uuid
-from typing import Any
+from typing import Any, Literal
 
 from PySide6.QtCore import QObject, Signal
 
@@ -12,6 +12,9 @@ from app.data.entities import SessionLogItem
 from app.services.handle_tasks import TaskService
 
 logger = logging.getLogger(__name__)
+
+# Type alias for session outcome values — prevents silent string typos.
+SessionOutcome = Literal["running", "paused", "completed", "stopped", "missed", "cancelled"]
 
 
 class FocusSessionService(QObject):
@@ -32,8 +35,10 @@ class FocusSessionService(QObject):
         self._focus_tick_engine = focus_tick_engine
         self._gaze_service = None
 
-        # In-memory cache so _on_gaze_updated (10 Hz) doesn't hit the DB
+        # In-memory cache so _on_gaze_updated (10 Hz) doesn't hit the DB.
+        # _active_session_cache stores the full entity; _active_session_id is the fast-path.
         self._active_session_cache: SessionLogItem | None = None
+        self._active_session_id: str | None = None  # for O(1) session_by_id lookup
 
     # -----------------------------------------------------------------------
     # Service wiring
@@ -95,20 +100,27 @@ class FocusSessionService(QObject):
         self._active_session_cache = None
 
     def active_session(self) -> SessionLogItem | None:
-        # Return cache if still valid
-        if self._active_session_cache is not None:
-            # Validate that it is still open (ended_at still None and outcome open)
-            s = self._active_session_cache
-            if s.ended_at is None and str(getattr(s, "outcome", "")) in {"running", "paused"}:
-                return s
-            # Cache is stale — clear it and fall through to DB
+        # Fast-path: if we have a cached ID, try a single indexed DB lookup first.
+        if self._active_session_id is not None:
+            if self._active_session_cache is not None:
+                s = self._active_session_cache
+                if s.ended_at is None and str(getattr(s, "outcome", "")) in {"running", "paused"}:
+                    return s
+            # Cache entity is stale; attempt single-row lookup by ID.
+            session = self._session_by_id(self._active_session_id)
+            if session is not None and session.ended_at is None and str(getattr(session, "outcome", "")) in {"running", "paused"}:
+                self._active_session_cache = session
+                return session
+            # ID is no longer valid.
+            self._active_session_id = None
             self._active_session_cache = None
 
-        # DB fallback (only when cache is invalid/missing)
+        # Full scan fallback (only when no ID is cached — e.g. first call after startup).
         sessions = self._all_sessions()
         for session in sessions:
             if session.ended_at is None and str(getattr(session, "outcome", "")) in {"running", "paused"}:
                 self._active_session_cache = session
+                self._active_session_id = session.id
                 return session
         return None
 
@@ -147,6 +159,7 @@ class FocusSessionService(QObject):
         )
         saved = self.repository.add_session(session)
         self._active_session_cache = saved
+        self._active_session_id = saved.id
 
         # Notify tick engine (starts gaze, starts smoother)
         if self._focus_tick_engine is not None:
@@ -202,7 +215,7 @@ class FocusSessionService(QObject):
         self.session_changed.emit(updated)
         return updated
 
-    def stop_session(self, *, outcome: str = "stopped") -> SessionLogItem | None:
+    def stop_session(self, *, outcome: SessionOutcome = "stopped") -> SessionLogItem | None:
         session = self.active_session()
         if session is None:
             return None
@@ -217,10 +230,20 @@ class FocusSessionService(QObject):
         meta["paused_at"]      = None
         meta["state"]          = outcome
 
-        updated = replace(session, ended_at=now, outcome=outcome, meta=meta)
+        # Compute absent_seconds from the gaze service before the session ends.
+        absent_secs = 0
+        if self._gaze_service is not None:
+            try:
+                raw = getattr(self._gaze_service, "absent_seconds", None)
+                absent_secs = max(0, int(raw() if callable(raw) else (raw or 0)))
+            except Exception:
+                absent_secs = 0
+
+        updated = replace(session, ended_at=now, outcome=outcome, meta=meta, absent_seconds=absent_secs)
         updated = self.repository.add_session(updated)
         # Clear cache BEFORE emitting signals so gaze handler sees no active session
         self._active_session_cache = None
+        self._active_session_id = None
 
         if self._focus_tick_engine is not None:
             try:
@@ -275,6 +298,19 @@ class FocusSessionService(QObject):
         if hasattr(self.repository, "all_sessions"):
             return list(self.repository.all_sessions())
         return []
+
+    def _session_by_id(self, session_id: str) -> SessionLogItem | None:
+        """Single-row indexed lookup — O(1) alternative to scanning all_sessions()."""
+        if hasattr(self.repository, "session_by_id"):
+            try:
+                return self.repository.session_by_id(session_id)
+            except Exception:
+                pass
+        # Fallback: scan (only used if repository doesn't implement session_by_id)
+        for s in self._all_sessions():
+            if s.id == session_id:
+                return s
+        return None
 
     def _parse_meta_dt(self, value: Any) -> datetime | None:
         if not value:

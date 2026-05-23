@@ -33,13 +33,13 @@ def _resolve_model_path(preferred: Path) -> Path | None:
 
 
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        bundled = Path(getattr(sys, "_MEIPASS")) / "app" / "models" / "focus_drift_model.txt"
+        bundled = Path(getattr(sys, "_MEIPASS")) / "app" / "models" / "focus_drift_calibrated_model.joblib"
     else:
         # Walk up from this file to the package root, then into app/models.
-        bundled = Path(__file__).resolve().parent / "app" / "models" / "focus_drift_model.txt"
+        bundled = Path(__file__).resolve().parent / "app" / "models" / "focus_drift_calibrated_model.joblib"
         if not bundled.exists():
             # Also try relative to the bootstrap file itself (flat layout).
-            bundled = Path(__file__).resolve().parent / "models" / "focus_drift_model.txt"
+            bundled = Path(__file__).resolve().parent / "models" / "focus_drift_calibrated_model.joblib"
 
     return bundled if bundled.exists() else None
 
@@ -62,12 +62,12 @@ def build_focus_runtime(
     gaze_service: Any | None,
     extension_core: ExtensionCoreHandler,
 ) -> tuple[FocusSessionService, FocusTickEngine]:
-    preferred_model_path = Path(settings.app_data_dir()) / "models" / "focus_drift_model.txt"
+    preferred_model_path = Path(settings.app_data_dir()) / "models" / "focus_drift_calibrated_model.joblib"
     resolved_model_path = _resolve_model_path(preferred_model_path)
 
     if resolved_model_path is None:
         logger.warning(
-            "focus_drift_model.txt not found in app-data (%s) or bundled package. "
+            "focus_drift_calibrated_model.joblib not found in app-data (%s) or bundled package. "
             "Engine will start in degraded mode (rule-based fallback only).",
             preferred_model_path,
         )

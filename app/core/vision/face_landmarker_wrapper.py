@@ -73,7 +73,10 @@ class FaceLandmarkerWrapper:
         if not self._model_path.exists():
             raise FileNotFoundError(f"FaceLandmarker model not found: {self._model_path}")
 
-        base_opts = mp_python.BaseOptions(model_asset_path=str(self._model_path))
+        base_opts = mp_python.BaseOptions(
+            model_asset_path=str(self._model_path),
+            delegate=mp_python.BaseOptions.Delegate.CPU
+        )
         opts = mp_vision.FaceLandmarkerOptions(
             base_options=base_opts,
             running_mode=mp_vision.RunningMode.IMAGE,

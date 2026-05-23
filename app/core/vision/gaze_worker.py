@@ -26,6 +26,9 @@ class GazeWorker(QThread):
     Emits frame_quality signal with quality metadata for diagnostics.
     """
 
+    # Optimization for low end systems
+    _ALL_RUNNING_WORKERS: list[GazeWorker] = []
+
     gaze_result = Signal(object)    # GazeResult
     frame_quality = Signal(dict)    # quality meta
     camera_status = Signal(str, str)  # status, detail
@@ -43,6 +46,22 @@ class GazeWorker(QThread):
         self._model_path = Path(model_path)
         self._camera_index = camera_index
         self._running = False
+        # Optimization for low end systems
+        self.finished.connect(self._on_thread_finished)
+
+    def start(self, priority: QThread.Priority = QThread.Priority.InheritPriority) -> None:
+        # Optimization for low end systems
+        if self not in GazeWorker._ALL_RUNNING_WORKERS:
+            GazeWorker._ALL_RUNNING_WORKERS.append(self)
+        super().start(priority)
+
+    def _on_thread_finished(self) -> None:
+        # Optimization for low end systems
+        try:
+            if self in GazeWorker._ALL_RUNNING_WORKERS:
+                GazeWorker._ALL_RUNNING_WORKERS.remove(self)
+        except Exception:
+            pass
 
         # Components — created in run() to be thread-safe
         self._enhancer: Optional[FrameEnhancer] = None
@@ -81,17 +100,17 @@ class GazeWorker(QThread):
     def run(self) -> None:
         self._running = True
 
-        self._enhancer = FrameEnhancer()
-        self._extractor = FeatureExtractor(
+        enhancer = FrameEnhancer()
+        extractor = FeatureExtractor(
             neutral_iris_x=self._neutral_iris_x,
             neutral_iris_y=self._neutral_iris_y,
             neutral_yaw=self._neutral_yaw,
             neutral_pitch=self._neutral_pitch,
         )
-        self._classifier = GazeZoneClassifier(is_calibrated=False)
+        classifier = GazeZoneClassifier(is_calibrated=False)
 
         try:
-            self._landmarker = FaceLandmarkerWrapper(self._model_path)
+            landmarker = FaceLandmarkerWrapper(self._model_path)
         except FileNotFoundError as exc:
             logger.error(f"GazeWorker: model not found — {exc}. Running without vision.")
             self._running = False
@@ -103,9 +122,22 @@ class GazeWorker(QThread):
             self.camera_status.emit("unavailable", "camera_open_failed")
             self._running = False
             return
+        self._cap = cap
 
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        # Optimization for low end systems
+        is_low_end = False
+        try:
+            import psutil
+            is_low_end = (psutil.cpu_count(logical=True) or 4) <= 4
+        except Exception:
+            pass
+
+        if is_low_end:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+        else:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         cap.set(cv2.CAP_PROP_FPS, 30)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
@@ -133,20 +165,20 @@ class GazeWorker(QThread):
             consecutive_failures = 0
 
             # 1. Enhance
-            enhanced, quality_meta = self._enhancer.enhance(frame)
+            enhanced, quality_meta = enhancer.enhance(frame)
 
             # 2. Detect landmarks
-            lm_result = self._landmarker.process_frame(enhanced)
+            lm_result = landmarker.process_frame(enhanced)
 
             # 3. Extract features
-            if self._extractor.neutral_iris_x != self._neutral_iris_x:
-                self._extractor.update_neutral(
+            if extractor.neutral_iris_x != self._neutral_iris_x:
+                extractor.update_neutral(
                     self._neutral_iris_x,
                     self._neutral_iris_y,
                     self._neutral_yaw,
                     self._neutral_pitch,
                 )
-            features = self._extractor.extract(lm_result, quality_meta)
+            features = extractor.extract(lm_result, quality_meta)
 
             # 4. Map gaze
             gaze_point: Optional[GazePoint] = None
@@ -162,24 +194,33 @@ class GazeWorker(QThread):
                     screen_h=self._active_screen_h,
                     iris_confidence=features.iris_confidence,
                 )
-                self._classifier.set_calibrated(True)
+                classifier.set_calibrated(True)
             else:
-                self._classifier.set_calibrated(mapper is not None and mapper.is_calibrated(self._active_screen_id))
+                classifier.set_calibrated(mapper is not None and mapper.is_calibrated(self._active_screen_id))
 
             # 5. Classify zone
-            result = self._classifier.classify(gaze_point, features)
+            result = classifier.classify(gaze_point, features)
 
             self.gaze_result.emit(result)
             self.frame_quality.emit(quality_meta)
 
-        cap.release()
-        if self._landmarker:
-            self._landmarker.close()
+        if hasattr(self, "_cap") and self._cap is not None:
+            self._cap.release()
+            self._cap = None
+        try:
+            landmarker.close()
+        except Exception:
+            pass
 
     def stop_request(self) -> None:
         """Signal the run loop to exit. Does NOT block — caller owns the wait()."""
         self._running = False
         self.requestInterruption()
+        try:
+            if hasattr(self, "_cap") and self._cap is not None:
+                self._cap.release()
+        except Exception:
+            pass
 
     @staticmethod
     def _open_camera(camera_index: int) -> cv2.VideoCapture:

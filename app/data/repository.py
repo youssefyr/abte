@@ -6,13 +6,14 @@ from pathlib import Path
 from typing import Any, Callable
 import json
 import sqlite3
+import threading
 import uuid
 
 from PySide6.QtCore import QObject, Signal
 
 from app.data.entities import CalendarEventItem, NotificationItem, PluginItem, SessionLogItem, TaskItem, FocusTickItem, UserProfileItem
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 
 
 def _utcnow() -> datetime:
@@ -147,6 +148,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     focus_score_avg REAL,
     distraction_events INTEGER NOT NULL DEFAULT 0,
     absent_seconds INTEGER NOT NULL DEFAULT 0,
+    target_minutes INTEGER,
     meta_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_started_at ON sessions(started_at DESC);
@@ -163,6 +165,7 @@ CREATE TABLE IF NOT EXISTS focus_ticks (
 );
 CREATE INDEX IF NOT EXISTS idx_focus_ticks_started_at ON focus_ticks(started_at);
 CREATE INDEX IF NOT EXISTS idx_focus_ticks_session_id ON focus_ticks(session_id);
+CREATE INDEX IF NOT EXISTS idx_focus_ticks_session_window ON focus_ticks(session_id, started_at, ended_at);
 
 
 
@@ -187,6 +190,34 @@ CREATE TABLE IF NOT EXISTS profiles (
 """
 
 
+class ThreadSafeConnection:
+    def __init__(self, db_path: Path) -> None:
+        super().__setattr__("_db_path", db_path)
+        super().__setattr__("_local", threading.local())
+
+    @property
+    def _conn(self) -> sqlite3.Connection:
+        if not hasattr(self._local, "conn"):
+            conn = sqlite3.connect(str(self._db_path), timeout=30.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
+            self._local.conn = conn
+        return self._local.conn
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(self._conn, name)
+        if callable(attr):
+            def wrapper(*args, **kwargs):
+                return attr(*args, **kwargs)
+            return wrapper
+        return attr
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(self._conn, name, value)
+
+
 class SqliteRepository(QObject):
     tasks_changed = Signal()
     notifications_changed = Signal()
@@ -197,26 +228,33 @@ class SqliteRepository(QObject):
 
     def __init__(self, database_path: str | Path, parent: QObject | None = None) -> None:
         super().__init__(parent)
+        self._lock = threading.RLock()
         self._db_path = Path(database_path).expanduser()
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self._db_path))
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA foreign_keys = ON")
-        self._conn.execute("PRAGMA journal_mode = WAL")
+        self._conn = ThreadSafeConnection(self._db_path)
         self._plugin_migrations: dict[str, Callable[[sqlite3.Connection, int], int]] = {}
         self._init_schema()
 
     @contextmanager
     def transaction(self):
-        try:
-            self._conn.execute("BEGIN")
-            yield
-            self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
+        with self._lock:
+            in_trans = self._conn.in_transaction
+            if not in_trans:
+                self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+                if not in_trans:
+                    self._conn.commit()
+            except Exception:
+                if not in_trans:
+                    self._conn.rollback()
+                raise
 
     def close(self) -> None:
+        try:
+            self._conn.execute("PRAGMA optimize")
+        except Exception:
+            pass
         self._conn.close()
 
     def _init_schema(self) -> None:
@@ -244,12 +282,20 @@ class SqliteRepository(QObject):
         self._run_core_migrations()
 
     def _run_core_migrations(self) -> None:
-        row = self._conn.execute("SELECT value FROM app_meta WHERE key='schema_version'").fetchone()
-        current = int(row["value"]) if row else 0
-        if current >= CURRENT_SCHEMA_VERSION:
-            return
+        # Define core migrations declaratively.
+        # Each migration specifies:
+        # - version: int
+        # - check_fn: Callable[[], bool] -> returns True if migration features are ALREADY present
+        # - migrate_fn: Callable[[], None] -> performs the schema alteration
+        
+        def check_v4() -> bool:
+            try:
+                self._conn.execute("SELECT 1 FROM focus_ticks LIMIT 1")
+                return True
+            except sqlite3.OperationalError:
+                return False
 
-        with self.transaction():
+        def migrate_v4() -> None:
             self._conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS focus_ticks (
@@ -263,32 +309,79 @@ class SqliteRepository(QObject):
                 );
                 CREATE INDEX IF NOT EXISTS idx_focus_ticks_started_at ON focus_ticks(started_at);
                 CREATE INDEX IF NOT EXISTS idx_focus_ticks_session_id ON focus_ticks(session_id);
+                CREATE INDEX IF NOT EXISTS idx_focus_ticks_session_window ON focus_ticks(session_id, started_at, ended_at);
                 """
             )
-            self._conn.execute(
-                "UPDATE app_meta SET value=? WHERE key='schema_version'",
-                (str(CURRENT_SCHEMA_VERSION),),
+
+        def check_v5() -> bool:
+            try:
+                self._conn.execute("SELECT 1 FROM profiles LIMIT 1")
+                return True
+            except sqlite3.OperationalError:
+                return False
+
+        def migrate_v5() -> None:
+            self._conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS profiles (
+                    id TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    avatar_path TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    meta_json TEXT NOT NULL DEFAULT '{}'
+                );
+                """
             )
 
-        row = self._conn.execute("SELECT value FROM app_meta WHERE key='schema_version'").fetchone()
-        current = int(row["value"]) if row else 0
-        if current < 5:
+        def check_v6() -> bool:
+            try:
+                self._conn.execute("SELECT target_minutes FROM sessions LIMIT 1")
+                return True
+            except sqlite3.OperationalError:
+                return False
+
+        def migrate_v6() -> None:
+            try:
+                self._conn.execute("ALTER TABLE sessions ADD COLUMN target_minutes INTEGER")
+            except sqlite3.OperationalError:
+                pass  # already exists
+
+        migrations = [
+            (4, check_v4, migrate_v4),
+            (5, check_v5, migrate_v5),
+            (6, check_v6, migrate_v6),
+        ]
+
+        # Read current version baseline from DB
+        try:
+            row = self._conn.execute("SELECT value FROM app_meta WHERE key='schema_version'").fetchone()
+            db_version = int(row["value"]) if row else 0
+        except sqlite3.OperationalError:
+            db_version = 0
+
+        max_applied_version = db_version
+
+        for version, check_fn, migrate_fn in migrations:
+            # We run the migration if:
+            # 1. The db_version in app_meta is lower than this migration's version
+            # OR 2. The structural check determines that the features are physically missing
+            is_present = check_fn()
+            
+            if db_version < version or not is_present:
+                if not is_present:
+                    with self.transaction():
+                        migrate_fn()
+                max_applied_version = max(max_applied_version, version)
+            else:
+                max_applied_version = max(max_applied_version, version)
+
+        # Sync the app_meta schema_version to match the actual verified max version
+        if max_applied_version > db_version:
             with self.transaction():
-                self._conn.executescript(
-                    """
-                    CREATE TABLE IF NOT EXISTS profiles (
-                        id TEXT PRIMARY KEY,
-                        display_name TEXT NOT NULL,
-                        avatar_path TEXT NOT NULL DEFAULT '',
-                        created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL,
-                        meta_json TEXT NOT NULL DEFAULT '{}'
-                    );
-                    """
-                )
                 self._conn.execute(
-                    "UPDATE app_meta SET value=? WHERE key='schema_version'",
-                    ("5",),
+                    "INSERT OR REPLACE INTO app_meta(key, value) VALUES('schema_version', ?)",
+                    (str(max_applied_version),),
                 )
 
     def register_migration(self, plugin_id: str, migrate_fn) -> None:
@@ -465,28 +558,31 @@ class SqliteRepository(QObject):
         return [self._notification_from_row(row) for row in rows]
 
     def mark_notification_read(self, notification_id: str) -> bool:
-        result = self._conn.execute(
-            "UPDATE notifications SET read_at=? WHERE id=?",
-            (_ts(_utcnow()), notification_id),
-        ).rowcount
+        with self.transaction():
+            result = self._conn.execute(
+                "UPDATE notifications SET read_at=? WHERE id=?",
+                (_ts(_utcnow()), notification_id),
+            ).rowcount
         if result > 0:
             self.notifications_changed.emit()
         return result > 0
 
     def mark_all_notifications_read(self) -> int:
-        result = self._conn.execute(
-            "UPDATE notifications SET read_at=? WHERE read_at IS NULL",
-            (_ts(_utcnow()),),
-        ).rowcount
+        with self.transaction():
+            result = self._conn.execute(
+                "UPDATE notifications SET read_at=? WHERE read_at IS NULL",
+                (_ts(_utcnow()),),
+            ).rowcount
         if result > 0:
             self.notifications_changed.emit()
         return result
 
     def delete_notification(self, notification_id: str) -> bool:
-        result = self._conn.execute(
-            "DELETE FROM notifications WHERE id=?",
-            (notification_id,),
-        ).rowcount
+        with self.transaction():
+            result = self._conn.execute(
+                "DELETE FROM notifications WHERE id=?",
+                (notification_id,),
+            ).rowcount
         if result > 0:
             self.notifications_changed.emit()
         return result > 0
@@ -534,14 +630,19 @@ class SqliteRepository(QObject):
         rows = self._conn.execute("SELECT * FROM sessions ORDER BY started_at DESC").fetchall()
         return [self._session_from_row(row) for row in rows]
 
+    def session_by_id(self, session_id: str) -> SessionLogItem | None:
+        """Single indexed row lookup — O(1) compared to scanning all_sessions()."""
+        row = self._conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
+        return self._session_from_row(row) if row else None
+
     def add_session(self, session: SessionLogItem) -> SessionLogItem:
         with self.transaction():
             self._conn.execute(
                 """
                 INSERT OR REPLACE INTO sessions(
                     id, started_at, ended_at, mode, planned_task_id, outcome,
-                    focus_score_avg, distraction_events, absent_seconds, meta_json
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    focus_score_avg, distraction_events, absent_seconds, target_minutes, meta_json
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session.id,
@@ -553,6 +654,7 @@ class SqliteRepository(QObject):
                     session.focus_score_avg,
                     session.distraction_events,
                     session.absent_seconds,
+                    getattr(session, "target_minutes", None),
                     _dumps(session.meta),
                 ),
             )
@@ -640,6 +742,16 @@ class SqliteRepository(QObject):
             (_ts(week_start), _ts(week_end)),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def get_latest_coach_report(self) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            """
+            SELECT * FROM coach_reports
+            ORDER BY created_at DESC, week_end DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        return dict(row) if row else None
 
     def reset_all_data(self) -> None:
         with self.transaction():
@@ -822,6 +934,7 @@ class SqliteRepository(QObject):
             focus_score_avg=row["focus_score_avg"],
             distraction_events=int(row["distraction_events"]),
             absent_seconds=int(row["absent_seconds"]),
+            target_minutes=row["target_minutes"] if "target_minutes" in row.keys() else None,
             meta=_loads(row["meta_json"], {}),
         )
     def add_focus_tick(self, tick: FocusTickItem) -> FocusTickItem:

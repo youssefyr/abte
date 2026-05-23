@@ -54,6 +54,7 @@ class GazeService(QObject):
 
         self._noise_events: int = 0
         self._fatigue_cooldown: float = 0.0
+        self._winding_down_workers: list = []  # holds refs to stopping workers to prevent GC
 
         self._restore_calibrations()
 
@@ -76,8 +77,28 @@ class GazeService(QObject):
     def attach_session_service(self, session_service: QObject) -> None:
         """
         Wire gaze lifecycle to a FocusSessionService.
-        Safe to call multiple times — duplicate connections are prevented.
+
+        IMPORTANT: In the current ABTE wiring, this method should NOT be called if
+        FocusSessionService.set_gaze_service() has already been used to wire the
+        lifecycle — that path calls start()/stop() directly via on_session_started/ended.
+        Calling both creates a double-start bug (gaze worker spawned twice, camera
+        opened twice). This guard detects and blocks the duplicate wiring at runtime
+        instead of relying on a comment.
         """
+        started_signal = getattr(session_service, "session_started", None)
+        if started_signal is not None:
+            try:
+                # PySide6 exposes receiver count; >0 means something is already connected.
+                if started_signal.receivers(started_signal) > 0:
+                    logger.warning(
+                        "GazeService.attach_session_service(): session_started already has "
+                        "receivers — skipping to prevent double-start bug. Use only one "
+                        "wiring path (set_gaze_service OR attach_session_service, not both)."
+                    )
+                    return
+            except Exception:
+                pass  # receivers() may not be available in all PySide6 versions
+
         for signal, slot in [
             (session_service.session_started, self._on_session_started),  # type: ignore[attr-defined]
             (session_service.session_ended, self._on_session_ended),      # type: ignore[attr-defined]
@@ -133,25 +154,60 @@ class GazeService(QObject):
     def stop(self) -> None:
         """Synchronous stop — only call from the worker thread or shutdown paths."""
         self._do_stop()
+        # Also clean up and wait for any winding-down workers to prevent GC SIGSEGV/SIGABRT on shutdown
+        for worker in list(getattr(self, "_winding_down_workers", [])):
+            try:
+                if worker.isRunning():
+                    worker.stop_request()
+                    worker.wait(3000)
+            except Exception:
+                pass
+        self._winding_down_workers = []
 
     def _stop_async(self) -> None:
         """
         Non-blocking stop for use from the main Qt thread.
-        Signals the worker to stop and waits with a short timer rather than
-        blocking the event loop with worker.wait().
+        Signals the worker to stop and lets it wind down cleanly without blocking.
         """
         if not self._worker:
             return
         worker = self._worker
         self._worker = None
-        # Tell the thread to exit — it will emit finished() when done
+        
+        if not hasattr(self, "_winding_down_workers"):
+            self._winding_down_workers = []
+        self._winding_down_workers.append(worker)
+
         worker.stop_request()
-        # Give it 100ms to wind down, then force-terminate if still alive
+
+        # State tracking to ensure cleanup runs exactly once and avoids use-after-free
+        state = {"cleaned_up": False}
+
         def _cleanup() -> None:
-            if worker.isRunning():
-                worker.terminate()
-                worker.wait(500)
-        QTimer.singleShot(150, _cleanup)
+            if state["cleaned_up"]:
+                return
+            state["cleaned_up"] = True
+
+            try:
+                try:
+                    worker.finished.disconnect(_cleanup)
+                except Exception:
+                    pass
+
+                if worker.isRunning():
+                    logger.debug("GazeWorker: waiting cleanly for thread to wind down...")
+                    worker.wait(3000)
+            except Exception as e:
+                logger.debug("Error in gaze worker cleanup: %s", e)
+            finally:
+                try:
+                    if worker in self._winding_down_workers:
+                        self._winding_down_workers.remove(worker)
+                except Exception as e:
+                    logger.debug("Error removing worker from winding down list: %s", e)
+
+        worker.finished.connect(_cleanup)
+        QTimer.singleShot(3000, _cleanup)
         logger.info("GazeService: async stop requested.")
 
     def _do_stop(self) -> None:
@@ -175,8 +231,18 @@ class GazeService(QObject):
             self.start()
 
     def shutdown(self) -> None:
+        """Synchronous full shutdown — drains winding-down workers to prevent GC SIGSEGV."""
         self.set_enabled(False)
         self._do_stop()
+        # Wait for any winding-down workers to finish before the event loop tears down.
+        for worker in list(getattr(self, "_winding_down_workers", [])):
+            try:
+                if worker.isRunning():
+                    worker.stop_request()
+                    worker.wait(3000)
+            except Exception:
+                pass
+        self._winding_down_workers = []
 
     def is_running(self) -> bool:
         return bool(self._worker and self._worker.isRunning())

@@ -6,6 +6,7 @@ from PySide6.QtCore import QEasingCurve, Property, QPropertyAnimation, Qt, Signa
 from PySide6.QtGui import QColor, QCursor, QPainter, QPaintEvent, QPen, QPixmap, QPainterPath, QFont
 from PySide6.QtWidgets import (
     QCheckBox,
+    QDialog,
     QFrame,
     QGraphicsOpacityEffect,
     QHBoxLayout,
@@ -303,3 +304,112 @@ class GalaxyBackdropWidget(QWidget):
         painter.drawEllipse(int(self.width() * 0.65), int(self.height() * 0.18), 260, 180)
         painter.drawEllipse(int(self.width() * 0.18), int(self.height() * 0.56), 320, 220)
         painter.end()
+
+
+class PopupBaseDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.WindowType.Popup
+            | Qt.WindowType.FramelessWindowHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self._drag_offset = None
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._drag_offset = None
+        super().mouseReleaseEvent(event)
+
+
+class TemplateGuidePopup(PopupBaseDialog):
+    def __init__(self, placeholders: list[dict[str, str]], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        # Use CardElevated object name so the theme stylesheet applies a solid background
+        self.setObjectName("CardElevated")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(14)
+
+        header = QHBoxLayout()
+        title_label = make_label("Sidebar Subtitle Placeholders", "sectionTitle")
+        close_btn = make_button("×", "ghost")
+        close_btn.setFixedSize(28, 28)
+        close_btn.clicked.connect(self.close)
+        header.addWidget(title_label)
+        header.addStretch(1)
+        header.addWidget(close_btn)
+        layout.addLayout(header)
+
+        intro = make_label(
+            "Use these placeholders in your custom sidebar text. "
+            "They will be replaced automatically with real-time values:",
+            "muted",
+            word_wrap=True
+        )
+        layout.addWidget(intro)
+
+        from PySide6.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView
+        table = QTableWidget(len(placeholders), 2)
+        table.setHorizontalHeaderLabels(["Placeholder", "Description"])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        table.setMinimumHeight(min(280, 36 + len(placeholders) * 28))
+        table.setMaximumHeight(380)
+
+        for idx, item in enumerate(placeholders):
+            p_item = QTableWidgetItem(item["placeholder"])
+            table.setItem(idx, 0, p_item)
+
+            desc_item = QTableWidgetItem(item["description"])
+            table.setItem(idx, 1, desc_item)
+
+        layout.addWidget(table)
+
+        hint = make_label("Click and drag to move. Click × to close.", "muted")
+        layout.addWidget(hint, 0, Qt.AlignmentFlag.AlignCenter)
+
+        # Let the layout size the window naturally; just set a sensible minimum
+        self.setMinimumSize(480, 340)
+
+    def show_at_widget(self, target: QWidget) -> None:
+        self.adjustSize()
+        # Map the bottom-left of the target widget to global screen coordinates
+        gp = target.mapToGlobal(target.rect().bottomLeft())
+        x = gp.x()
+        y = gp.y() + 4  # small gap below the widget
+
+        from PySide6.QtWidgets import QApplication
+        screen = QApplication.screenAt(gp)
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        avail = screen.availableGeometry()
+
+        # Clamp within screen bounds
+        if x + self.width() > avail.right():
+            x = avail.right() - self.width()
+        if y + self.height() > avail.bottom():
+            # flip above the widget
+            y = target.mapToGlobal(target.rect().topLeft()).y() - self.height() - 4
+        x = max(avail.left(), x)
+        y = max(avail.top(), y)
+
+        self.move(x, y)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+

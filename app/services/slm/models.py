@@ -125,3 +125,33 @@ class PlannerDiagnostics:
     benchmark_weight: float = 0.0
     heuristic_weight: float = 1.0
     notes: list[str] = field(default_factory=list)
+
+
+def resolve_llama_binary(name: str) -> str | None:
+    import os
+    import sys
+    import shutil
+    
+    # Check bundled paths or executable dir if frozen
+    search_dirs = []
+    if getattr(sys, "frozen", False):
+        if hasattr(sys, "_MEIPASS"):
+            search_dirs.append(str(Path(sys._MEIPASS)))
+            search_dirs.append(str(Path(sys._MEIPASS) / "bin"))
+            search_dirs.append(str(Path(sys._MEIPASS) / "app" / "bin"))
+        exe_dir = Path(sys.executable).parent
+        search_dirs.append(str(exe_dir))
+        search_dirs.append(str(exe_dir / "bin"))
+    else:
+        script_dir = Path(__file__).resolve().parent.parent.parent.parent
+        search_dirs.append(str(script_dir))
+        search_dirs.append(str(script_dir / "bin"))
+        search_dirs.append(str(script_dir / ".venv" / "bin"))
+        if sys.platform.startswith("win"):
+            search_dirs.append(str(script_dir / ".venv" / "Scripts"))
+
+    search_path_str = os.pathsep.join(search_dirs) + os.pathsep + os.environ.get("PATH", "")
+    try:
+        return shutil.which(name, path=search_path_str)
+    except TypeError:
+        return shutil.which(name)

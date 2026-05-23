@@ -7,6 +7,7 @@ from app.services.slm import SlmService
 
 
 def apply_development_bootstrap(settings: Any, repository: Any) -> None:
+    repository._run_core_migrations()
     if bool(settings.get("Development/dev_reset_database", False)):
         repository.reset_all_data()
         settings.set("Development/dev_reset_database", False)

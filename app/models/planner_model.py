@@ -59,7 +59,7 @@ class EnergyPatternModel:
             focus = float(session.focus_score_avg if session.focus_score_avg is not None else 50.0)
             duration_minutes = self._session_duration_minutes(session)
             rows.append([hour, focus, duration_minutes])
-        if len(rows) < self.cluster_count or KMeans is None:
+        if len(rows) < max(2, self.cluster_count) or KMeans is None:
             return self._fallback_hour_scores(rows)
         model = KMeans(n_clusters=min(self.cluster_count, len(rows)), n_init='auto', random_state=self.random_state)
         labels = model.fit_predict(rows)

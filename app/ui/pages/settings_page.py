@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Signal, Qt
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -18,10 +18,12 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QPlainTextEdit,
     QMessageBox,
+    QWidget,
 )
 
 from app.ui.pages.base_page import BasePage
 from app.ui.ui_helpers import StepperSpinBox, ToggleSwitch, make_card, make_label
+from app.ui.slm_model_selector import ModelSelectorWidget
 from app.services.slm import SlmService
 from app.services.gaze_service import GazeService
 from app.services.fake_data_service import FakeDataService
@@ -39,6 +41,7 @@ class SettingsPage(BasePage):
         repository: Any,
         active_window_service=None,
         gaze_service: GazeService | None = None,
+        sidebar_template_service=None,
         parent=None,
     ):
         super().__init__(metrics, parent)
@@ -47,6 +50,7 @@ class SettingsPage(BasePage):
         self.slm_service = SlmService(settings, repository)
         self.active_window_service = active_window_service
         self.gaze_service = gaze_service
+        self.sidebar_template_service = sidebar_template_service
 
         self.main_layout.setContentsMargins(0, 0, 0, 0)
         self.main_layout.setSpacing(12)
@@ -67,6 +71,12 @@ class SettingsPage(BasePage):
         )
         self.nav_layout.addStretch()
 
+        # Flat right column widget and layout
+        self.right_widget = QWidget()
+        self.right_layout = QVBoxLayout(self.right_widget)
+        self.right_layout.setContentsMargins(0, 0, 0, 0)
+        self.right_layout.setSpacing(14)
+
         self.body_card, self.body_layout = make_card("Settings", "Configuration options.", elevated=False)
         self.body_layout.addStretch()
 
@@ -76,7 +86,9 @@ class SettingsPage(BasePage):
         self.apply_btn.setEnabled(False)
 
         main_layout.addWidget(self.nav_card, 1)
-        main_layout.addWidget(self.body_card, 3)
+        main_layout.addWidget(self.right_widget, 3)
+
+        self.right_layout.addWidget(self.body_card)
 
         self.open_setup_btn = QPushButton("Open startup setup")
         self.open_setup_btn.setObjectName("SecondaryButton")
@@ -90,10 +102,12 @@ class SettingsPage(BasePage):
 
         self._load_schema()
         self.load_from_settings()
+        self._build_model_selector_panel()
         self._build_extension_panel()
         self._build_gaze_diagnostics_panel()
         self._build_slm_diagnostics_panel()
         self._build_fake_data_panel()
+        self.right_layout.addStretch()
         self._refresh_extension_panel()
         self._refresh_gaze_diagnostics()
         self._refresh_slm_diagnostics()
@@ -140,6 +154,12 @@ class SettingsPage(BasePage):
                     "type": "text",
                     "default": "",
                 },
+                {
+                    "key": "Profile/custom_sidebar_text",
+                    "label": "Custom sidebar subtitle text",
+                    "type": "text",
+                    "default": "PLANNER · DOER",
+                },
             ],
             "Advanced": [
                 {
@@ -164,12 +184,6 @@ class SettingsPage(BasePage):
                 },
             ],
             "AI / Setup": [
-                {
-                    "key": "SLM/model_path",
-                    "label": "SLM model path (GGUF)",
-                    "type": "text",
-                    "default": str(self.settings.app_data_dir() / "models" / "phi3-mini-q4_k_m.gguf"),
-                },
                 {
                     "key": "SLM/backend",
                     "label": "SLM backend",
@@ -197,12 +211,6 @@ class SettingsPage(BasePage):
                 {
                     "key": "SLM/decomposition_enabled",
                     "label": "Enable task decomposition",
-                    "type": "boolean",
-                    "default": False,
-                },
-                {
-                    "key": "Startup/first_run_completed",
-                    "label": "Startup setup completed",
                     "type": "boolean",
                     "default": False,
                 },
@@ -235,12 +243,6 @@ class SettingsPage(BasePage):
                     "min": 50,
                     "max": 5000,
                     "default": 250,
-                },
-                {
-                    "key": "SLM/benchmark_summary",
-                    "label": "Last benchmark summary",
-                    "type": "text",
-                    "default": "No benchmark history yet.",
                 },
             ],
             "Vision / Gaze": [
@@ -312,6 +314,15 @@ class SettingsPage(BasePage):
                 lbl = make_label(field["label"])
                 self.labels_to_search.append(lbl)
                 row_layout.addWidget(lbl)
+
+                if field["key"] == "Profile/custom_sidebar_text":
+                    info_btn = QPushButton("ⓘ")
+                    info_btn.setObjectName("SidebarTextInfoBtn")
+                    info_btn.setFixedSize(22, 22)
+                    info_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                    info_btn.clicked.connect(self._show_sidebar_help)
+                    row_layout.addWidget(info_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+
                 row_layout.addStretch()
 
                 widget = None
@@ -342,6 +353,20 @@ class SettingsPage(BasePage):
                     self._dynamic_widgets[key] = {"widget": widget, "type": ftype}
 
                 self.body_layout.insertWidget(self.body_layout.count() - 2, row)
+
+    def _show_sidebar_help(self):
+        if not self.sidebar_template_service:
+            return
+
+        placeholders = self.sidebar_template_service.get_placeholders_metadata()
+
+        from app.ui.ui_helpers import TemplateGuidePopup
+        popup = TemplateGuidePopup(placeholders, self)
+        widget_data = self._dynamic_widgets.get("Profile/custom_sidebar_text")
+        if widget_data and "widget" in widget_data:
+            popup.show_at_widget(widget_data["widget"])
+        else:
+            popup.show()
 
     def _default_for_key(self, key: str):
         return self._defaults.get(key)
@@ -434,14 +459,36 @@ class SettingsPage(BasePage):
         text = text.lower()
         if not text:
             for lbl in self.labels_to_search:
-                lbl.setStyleSheet("")
+                lbl.setProperty("highlighted", False)
+                lbl.style().unpolish(lbl)
+                lbl.style().polish(lbl)
             return
 
         for lbl in self.labels_to_search:
             if text in lbl.text().lower():
-                lbl.setStyleSheet("background-color: yellow; color: black;")
+                lbl.setProperty("highlighted", True)
             else:
-                lbl.setStyleSheet("")
+                lbl.setProperty("highlighted", False)
+            lbl.style().unpolish(lbl)
+            lbl.style().polish(lbl)
+
+    def _build_model_selector_panel(self) -> None:
+        model_card, model_layout = make_card(
+            "Model library",
+            "Browse, download, and switch between local GGUF models. Existing files are never deleted.",
+            elevated=False,
+        )
+
+        self._model_selector_widget = ModelSelectorWidget(self.settings, self)
+        self._model_selector_widget.model_path_changed.connect(self._on_catalog_model_selected)
+        model_layout.addWidget(self._model_selector_widget)
+
+        self.right_layout.addWidget(model_card)
+
+    def _on_catalog_model_selected(self, model_path: str) -> None:
+        """Refresh SLM diagnostics and emit setting change when a catalog model is selected."""
+        self._refresh_slm_diagnostics()
+        self.settings_applied.emit({"SLM/model_path": model_path})
 
     def _build_extension_panel(self) -> None:
         self.extension_card, extension_layout = make_card(
@@ -505,7 +552,7 @@ class SettingsPage(BasePage):
         extension_layout.addWidget(self.window_title_table)
         extension_layout.addWidget(self.extension_diag_text)
 
-        self.body_layout.insertWidget(self.body_layout.count() - 2, self.extension_card)
+        self.right_layout.addWidget(self.extension_card)
 
     def _build_gaze_diagnostics_panel(self) -> None:
         self.gaze_card, gaze_layout = make_card(
@@ -542,7 +589,7 @@ class SettingsPage(BasePage):
         gaze_layout.addWidget(self.gaze_detail_label)
         gaze_layout.addWidget(self.gaze_diag_text)
 
-        self.body_layout.insertWidget(self.body_layout.count() - 2, self.gaze_card)
+        self.right_layout.addWidget(self.gaze_card)
 
     def _refresh_gaze_diagnostics(self) -> None:
         if not self.gaze_service:
@@ -1082,7 +1129,7 @@ class SettingsPage(BasePage):
         diagnostics_layout.addWidget(self.summary_label)
         diagnostics_layout.addWidget(self.benchmark_table)
 
-        self.body_layout.insertWidget(self.body_layout.count() - 2, self.diagnostics_card)
+        self.right_layout.addWidget(self.diagnostics_card)
 
     def _refresh_slm_diagnostics(self) -> None:
         info = self.slm_service.planner_explain()
@@ -1165,7 +1212,7 @@ class SettingsPage(BasePage):
         actions.addStretch(1)
         layout.addLayout(actions)
 
-        self.body_layout.insertWidget(self.body_layout.count() - 2, self.fake_data_card)
+        self.right_layout.addWidget(self.fake_data_card)
 
     def _generate_fake_data(self) -> None:
         if not self.repository:

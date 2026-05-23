@@ -179,7 +179,7 @@ class ThemeManager:
         return p
 
     def _build_qss(self, t: ThemeSpec, m: UiMetrics) -> str:
-        # Single radius used here; pages can differentiate via UiMetrics if needed.
+        # Dynamic layout spacing variables
         r = f"{m.radius}px"
         pad = f"{m.card_padding}px"
         gap = f"{m.card_gap}px"
@@ -189,20 +189,43 @@ class ThemeManager:
         toolbar_h = f"{m.toolbar_height}px"
         topbar_h = f"{max(m.compact_control_height + 8, m.control_height + 4)}px"
 
-        kpi_r = f"{m.radius}px"
-        avatar_r = f"{max(m.radius + 18, m.radius * 2)}px"
+        # Continuous fluid dynamic derivatives
+        r_sm = f"{max(3, m.radius // 2)}px"
+        r_md = r
+        r_lg = f"{max(14, round(m.radius * 1.4))}px"
+        r_xl = f"{max(20, round(m.radius * 2.0))}px"
+        r_avatar = f"{max(m.radius + 18, m.radius * 2)}px"
+        r_toast = f"{max(6, m.radius - 2)}px"
+        r_wizard = f"{max(24, round(m.radius * 2.4))}px"
+        r_brand = f"{max(20, round(m.radius * 2.0))}px"
+
+        pad_sm = f"{max(4, m.card_padding // 2)}px"
+        pad_md = pad
+        pad_lg = f"{max(14, round(m.card_padding * 1.2))}px"
+        pad_side = f"{max(10, round(m.card_padding * 0.8))}px"
+
+        scroll_size = f"{max(8, round(10 * m.scale))}px"
+
+        kpi_r = r
+        avatar_r = r_avatar
         badge_r = f"{max(6, m.radius - 2)}px"
         progress_r = f"{max(3, m.radius // 2)}px"
         divider_h = "1px"
 
+        # Continuous typography sizing variables
         kpi_value_pt = f"{m.title_pt + 6}pt"
-        label_pt = f"{max(9, m.meta_pt)}pt"
+        label_pt = f"{m.meta_pt}pt"
         body_sm_pt = f"{m.body_pt}pt"
-        meta_pt = f"{max(9, m.meta_pt)}pt"
+        meta_pt = f"{m.meta_pt}pt"
         badge_pt = f"{max(8, m.meta_pt - 1)}pt"
         avatar_pt = f"{m.title_pt + 8}pt"
         badge_pad_v = "0px"
         badge_pad_h = f"{max(2, m.border_width // 2)}px"
+
+        pt_brand = f"{m.title_pt + 4}pt"
+        pt_section = f"{m.section_pt + 1}pt"
+        pt_toast = f"{m.body_pt}pt"
+        pt_info = f"{m.body_pt}pt"
 
         return f"""
         QWidget {{
@@ -266,7 +289,7 @@ class ThemeManager:
 
         QToolButton#SidebarNavItem {{
             min-height: {nav_h};
-            padding: 0 14px;
+            padding: 0 {pad_side};
             margin: 0;
             border-radius: {r};
             color: {t.text_muted};
@@ -655,6 +678,32 @@ class ThemeManager:
             border: 1px solid {t.border};
         }}
 
+        QPushButton#DangerButton {{
+            background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                                       stop:0 {t.danger},
+                                       stop:1 {t.danger});
+            color: #ffffff;
+            border: 1px solid {t.danger};
+            font-weight: 650;
+        }}
+
+        QPushButton#DangerButton:hover {{
+            background: {t.danger};
+            border: 1px solid {t.danger};
+            opacity: 0.9;
+        }}
+
+        QPushButton#DangerButton:pressed {{
+            background: {t.danger};
+            border: 1px solid {t.danger};
+        }}
+
+        QPushButton#DangerButton:disabled {{
+            background: {t.surface_alt};
+            color: {t.text_subtle};
+            border: 1px solid {t.border};
+        }}
+
         QPushButton#SecondaryButton {{
             background: {t.surface};
             color: {t.text};
@@ -826,9 +875,9 @@ class ThemeManager:
         }}
 
         QCheckBox::indicator {{
-            width: 18px;
-            height: 18px;
-            border-radius: 4px;
+            width: {max(14, round(16 * m.scale))}px;
+            height: {max(14, round(16 * m.scale))}px;
+            border-radius: {r_sm};
             background: {t.surface};
             border: 1px solid {t.border};
         }}
@@ -902,7 +951,7 @@ class ThemeManager:
         }}
 
         QScrollBar:vertical {{
-            width: 10px;
+            width: {scroll_size};
             background: transparent;
             margin: 4px;
         }}
@@ -919,7 +968,7 @@ class ThemeManager:
         }}
 
         QScrollBar:horizontal {{
-            height: 10px;
+            height: {scroll_size};
             background: transparent;
             margin: 4px;
         }}
@@ -987,6 +1036,7 @@ class ThemeManager:
             font-weight: 700;
 
             border: none;
+            border-radius: 8px;
         }}
 
         QProgressBar#WeekProgressBar {{
@@ -1028,5 +1078,112 @@ class ThemeManager:
             min-height: {divider_h};
             max-height: {divider_h};
         }}
+
+        QPushButton#SidebarTextInfoBtn {{
+            background: transparent;
+            border: none;
+            color: {t.primary};
+            font-size: {pt_info};
+            font-weight: bold;
+            padding: 0;
+        }}
+        QPushButton#SidebarTextInfoBtn:hover {{
+            color: {t.info};
+        }}
+
+        QDialog#TemplateGuidePopup {{
+            background: {t.surface_alt};
+            border: 2px solid {t.border_strong};
+            border-radius: {r_lg};
+        }}
+
+        QFrame#WizardShell {{
+            background: {t.surface_alt};
+            border: 1px solid {t.border_strong};
+            border-radius: {r_wizard};
+        }}
+
+        QDialog#StartupWizardOverlay,
+        QWidget#StartupWizardOverlayRoot,
+        QWidget#StartupWizardCenterHost {{
+            background: transparent;
+            border: none;
+            color: {t.text};
+        }}
+
+        QLabel#ToastMessage {{
+            background-color: {t.surface_alt};
+            color: {t.text};
+            border: 2px solid {t.primary};
+            border-radius: {r_toast};
+            padding: {pad_md};
+            font-size: {pt_toast};
+        }}
+        QLabel#ToastMessage[level="error"] {{
+            border-color: {t.danger};
+        }}
+        QLabel#ToastMessage[level="warning"] {{
+            border-color: {t.warning};
+        }}
+
+        QLabel#GazeDot {{
+            font-size: 10px;
+            color: {t.text_subtle};
+        }}
+        QLabel#GazeDot[state="active"] {{
+            color: {t.primary};
+        }}
+        QLabel#GazeDot[state="degraded"] {{
+            color: {t.warning};
+        }}
+        QLabel#GazeDot[state="error"] {{
+            color: {t.danger};
+        }}
+
+        QFrame#InteractiveActivityRow {{
+            background-color: transparent;
+            border-radius: {r_sm};
+        }}
+        QFrame#InteractiveActivityRow:hover {{
+            background-color: {t.surface_alt};
+        }}
+
+        QLabel#ProfileNameLabel {{
+            font-size: {pt_brand};
+            font-weight: bold;
+        }}
+
+        QLabel#ActivityDot {{
+            font-size: 10px;
+            color: {t.primary};
+        }}
+        QLabel#ActivityDot[color_type="info"] {{
+            color: {t.info};
+        }}
+
+        QToolButton#SidebarBrandMark {{
+            border: none;
+            background: transparent;
+            border-radius: {r_brand};
+        }}
+        QToolButton#SidebarBrandMark:hover {{
+            background: {t.surface_alt};
+        }}
+
+        QLabel#SidebarAppTitle {{
+            font-size: {pt_section};
+            font-weight: 600;
+        }}
+
+        QWidget#NavHost {{
+            background: transparent;
+        }}
+
+        QLabel[highlighted="true"] {{
+            background-color: {t.primary};
+            color: #0E1512;
+            border-radius: {r_sm};
+        }}
         
         """
+        

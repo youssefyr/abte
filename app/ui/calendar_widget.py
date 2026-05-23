@@ -7,8 +7,13 @@ from PySide6.QtCore import QDateTime, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QButtonGroup,
+    QDateTimeEdit,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
     QFrame,
     QHBoxLayout,
+    QLineEdit,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -125,6 +130,55 @@ class TaskCard(QFrame):
         return None
 
 
+class EventCreateDialog(QDialog):
+    """Simple dialog to create a calendar event (#21)."""
+
+    def __init__(self, start_dt: datetime | None = None, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("New Calendar Event")
+        self.setMinimumWidth(380)
+
+        form = QFormLayout(self)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
+        form.setSpacing(12)
+
+        self._title_edit = QLineEdit()
+        self._title_edit.setPlaceholderText("Event title")
+        form.addRow("Title", self._title_edit)
+
+        default_start = start_dt or datetime.now().replace(second=0, microsecond=0)
+        default_end = default_start + timedelta(hours=1)
+
+        self._start_edit = QDateTimeEdit(default_start)
+        self._start_edit.setDisplayFormat("yyyy-MM-dd HH:mm")
+        self._start_edit.setCalendarPopup(True)
+        form.addRow("Start", self._start_edit)
+
+        self._end_edit = QDateTimeEdit(default_end)
+        self._end_edit.setDisplayFormat("yyyy-MM-dd HH:mm")
+        self._end_edit.setCalendarPopup(True)
+        form.addRow("End", self._end_edit)
+
+        self._location_edit = QLineEdit()
+        self._location_edit.setPlaceholderText("Optional location")
+        form.addRow("Location", self._location_edit)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def event_data(self) -> dict:
+        return {
+            "title": self._title_edit.text().strip(),
+            "starts_at": self._start_edit.dateTime().toPython(),
+            "ends_at": self._end_edit.dateTime().toPython(),
+            "location": self._location_edit.text().strip() or None,
+        }
+
+
 class FlexibleWeekViewWidget(QWidget):
     dayCountChanged = Signal(int)
     modeChanged = Signal(str)
@@ -181,6 +235,12 @@ class FlexibleWeekViewWidget(QWidget):
 
         if not compact:
             row1.addWidget(make_pill("Planner-aware", "default"))
+            self._add_event_btn = make_button("+ Event", "secondary")
+            self._add_event_btn.setToolTip("Create a new calendar event")
+            self._add_event_btn.clicked.connect(self._on_add_event_clicked)
+            row1.addWidget(self._add_event_btn)
+        else:
+            self._add_event_btn = None
 
         row2 = QHBoxLayout()
         row2.setSpacing(8)
@@ -463,3 +523,29 @@ class FlexibleWeekViewWidget(QWidget):
             self.task_service.schedule_task(task_id, dt)
         elif isinstance(dt, date):
             self.task_service.reschedule_to_day(task_id, dt)
+
+    def _on_add_event_clicked(self) -> None:
+        """Open the event creation dialog and persist the result"""
+        dialog = EventCreateDialog(parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        data = dialog.event_data()
+        if not data.get("title"):
+            return
+        if self.repository is None or not hasattr(self.repository, "add_calendar_event"):
+            return
+        import uuid as _uuid
+        from app.data.entities import CalendarEventItem
+        try:
+            event = CalendarEventItem(
+                id=str(_uuid.uuid4()),
+                title=data["title"],
+                starts_at=data["starts_at"],
+                ends_at=data["ends_at"],
+                source="manual",
+                location=data.get("location"),
+            )
+            self.repository.add_calendar_event(event)
+            self.refresh_data()
+        except Exception:
+            pass

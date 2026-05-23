@@ -115,22 +115,15 @@ class InteractiveActivityRow(QFrame):
         super().__init__(parent)
         self.setObjectName("InteractiveActivityRow")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setStyleSheet("""
-            #InteractiveActivityRow {
-                background-color: transparent;
-                border-radius: 6px;
-            }
-            #InteractiveActivityRow:hover {
-                background-color: rgba(255, 255, 255, 0.05);
-            }
-        """)
+        
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(10)
 
         dot = QLabel("●")
+        dot.setObjectName("ActivityDot")
+        dot.setProperty("color_type", "primary" if dot_color == "#3ECF8E" else "info")
         dot.setFixedWidth(14)
-        dot.setStyleSheet(f"color: {dot_color}; font-size: 10px;")
 
         text_label = QLabel(text)
         text_label.setObjectName("ActivityText")
@@ -224,7 +217,7 @@ class AccountPage(QWidget):
         name_row.setContentsMargins(0, 0, 0, 0)
         name_row.setSpacing(8)
         self._name_label = make_label("abte user", "sectionTitle")
-        self._name_label.setStyleSheet("font-size: 24px;")
+        self._name_label.setObjectName("ProfileNameLabel")
         
         self._edit_name_btn = QPushButton("✎")
         self._edit_name_btn.setObjectName("GhostButton")
@@ -357,21 +350,40 @@ class AccountPage(QWidget):
         root.addStretch(1)
 
     def _on_edit_name_clicked(self) -> None:
-        if not self._repository:
-            return
-        profile = self._repository.get_profile()
-        current_name = profile.display_name
+        current_name = "abte user"
+        profile = None
+        if self._repository:
+            try:
+                profile = self._repository.get_profile()
+                # display_name may be empty string — fall through to settings in that case
+                if profile is not None and profile.display_name:
+                    current_name = profile.display_name
+            except Exception as e:
+                logger.warning(f"Failed to get profile: {e}")
+
+        # Use settings fallback when repository has no name or is unavailable
+        if not current_name or current_name == "abte user":
+            if self._settings:
+                current_name = str(self._settings.get("Profile/display_name", current_name) or current_name)
 
         dialog = ProfileEditDialog(current_name, self)
-        if dialog.exec() == int(QDialog.DialogCode.Accepted):
+        if dialog.exec() == QDialog.DialogCode.Accepted:
             new_name = dialog.get_name()
             if new_name and new_name != current_name:
-                profile.display_name = new_name
-                self._repository.update_profile(profile)
+                # Persist to repository
+                if profile is not None and self._repository:
+                    profile.display_name = new_name
+                    try:
+                        self._repository.update_profile(profile)
+                    except Exception as e:
+                        logger.warning(f"Failed to update profile in repository: {e}")
+                # Always persist to settings as the source of truth for the UI
                 if self._settings:
                     self._settings.set("Profile/display_name", new_name)
                     self._settings.sync()
-                self.refresh_data()
+                # Update name label immediately — don't wait for the 60s timer
+                self._name_label.setText(new_name)
+                self._refresh_avatar()
 
     def apply_metrics(self, metrics: UiMetrics) -> None:
         self._metrics = metrics
@@ -434,6 +446,38 @@ class AccountPage(QWidget):
         logger.debug("AccountPage: FocusSessionService has no known sessions accessor.")
         return []
 
+    def _get_session_active_minutes(self, s: Any) -> float:
+        start_dt = getattr(s, "started_at", None)
+        if not start_dt:
+            return 0.0
+            
+        if isinstance(start_dt, (int, float)):
+            start_dt = datetime.fromtimestamp(start_dt)
+            
+        end_dt = getattr(s, "ended_at", None)
+        if end_dt is None:
+            end_dt = datetime.now()
+        elif isinstance(end_dt, (int, float)):
+            end_dt = datetime.fromtimestamp(end_dt)
+            
+        total_sec = (end_dt - start_dt).total_seconds()
+        
+        # Subtract paused seconds if present in meta
+        meta = getattr(s, "meta", None) or {}
+        paused_sec = 0.0
+        if isinstance(meta, dict):
+            paused_sec = float(meta.get("paused_seconds", 0) or 0)
+            paused_at_str = meta.get("paused_at")
+            if paused_at_str and getattr(s, "ended_at", None) is None:
+                try:
+                    paused_at = datetime.fromisoformat(paused_at_str)
+                    paused_sec += (datetime.now() - paused_at).total_seconds()
+                except Exception:
+                    pass
+                    
+        active_sec = max(0.0, total_sec - paused_sec)
+        return active_sec / 60.0
+
     def _refresh_stats(self) -> None:
         # ── Task counts ───────────────────────────────────────────────────
         try:
@@ -461,7 +505,7 @@ class AccountPage(QWidget):
 
             for s in sessions:
                 start_dt = getattr(s, "started_at", None)
-                dur = float(getattr(s, "duration_minutes", 0) or 0)
+                dur = self._get_session_active_minutes(s)
                 total_focus_minutes += dur
                 session_durations.append(dur)
 
@@ -474,6 +518,12 @@ class AccountPage(QWidget):
                     active_days.add(start_dt.strftime("%Y-%m-%d"))
 
             check = now.date()
+            if check.strftime("%Y-%m-%d") not in active_days:
+                # If no session today, check yesterday to keep streak active
+                yesterday = check - timedelta(days=1)
+                if yesterday.strftime("%Y-%m-%d") in active_days:
+                    check = yesterday
+            
             while check.strftime("%Y-%m-%d") in active_days:
                 streak_days += 1
                 check -= timedelta(days=1)
@@ -541,35 +591,64 @@ class AccountPage(QWidget):
             if widget is not None:
                 widget.deleteLater()
 
+        activities = []
+
         try:
             all_tasks = self._task_service.list_tasks()
-            completed = sorted(
-                [t for t in all_tasks if getattr(t, "status", "") == "done"],
-                key=lambda t: getattr(t, "updated_at", 0) or getattr(t, "created_at", 0),
-                reverse=True,
-            )[:10]
-
-            if not completed:
-                empty = make_label("No completed tasks yet. Finish a task to see it here.", "muted", word_wrap=True)
-                self._activity_body.addWidget(empty)
-                return
-
-            for task in completed:
-                title = getattr(task, "title", "Untitled task")
-                updated = getattr(task, "updated_at", None) or getattr(task, "created_at", None)
-                if updated:
-                    if isinstance(updated, (int, float)):
-                        updated = datetime.fromtimestamp(updated)
-                    meta = updated.strftime("%b %d, %H:%M")
+            completed_tasks = [t for t in all_tasks if getattr(t, "status", "") == "done"]
+            for task in completed_tasks:
+                ts_val = getattr(task, "updated_at", None) or getattr(task, "created_at", None)
+                if ts_val:
+                    if isinstance(ts_val, (int, float)):
+                        ts_dt = datetime.fromtimestamp(ts_val)
+                    else:
+                        ts_dt = ts_val
                 else:
-                    meta = "—"
-                row = _make_activity_row_wrapper(title, meta, dot_color="#3ECF8E")
-                self._activity_body.addWidget(row)
-
+                    ts_dt = datetime.min
+                activities.append({
+                    "timestamp": ts_dt,
+                    "text": f"Completed task: {getattr(task, 'title', 'Untitled task')}",
+                    "dot_color": "#3ECF8E"
+                })
         except Exception as exc:
-            logger.debug(f"AccountPage: activity refresh failed: {exc}")
-            err = make_label("Could not load activity.", "muted")
-            self._activity_body.addWidget(err)
+            logger.debug(f"AccountPage: task activity query failed: {exc}")
+
+        try:
+            sessions = self._get_sessions()
+            for s in sessions:
+                ended = getattr(s, "ended_at", None)
+                if ended:
+                    if isinstance(ended, (int, float)):
+                        ts_dt = datetime.fromtimestamp(ended)
+                    else:
+                        ts_dt = ended
+                    
+                    mins = self._get_session_active_minutes(s)
+                    mode = str(getattr(s, "mode", "focus") or "focus").title()
+                    activities.append({
+                        "timestamp": ts_dt,
+                        "text": f"Focus session: {mode} ({mins:.0f}m)",
+                        "dot_color": "#3B82F6"
+                    })
+        except Exception as exc:
+            logger.debug(f"AccountPage: session activity query failed: {exc}")
+
+        activities.sort(key=lambda x: x["timestamp"], reverse=True)
+        recent_activities = activities[:10]
+
+        if not recent_activities:
+            empty = make_label("No recent activity yet.", "muted", word_wrap=True)
+            self._activity_body.addWidget(empty)
+            return
+
+        for act in recent_activities:
+            ts_val = act["timestamp"]
+            if ts_val == datetime.min:
+                meta = "—"
+            else:
+                meta = ts_val.strftime("%b %d, %H:%M")
+            row = _make_activity_row_wrapper(act["text"], meta, dot_color=act["dot_color"])
+            self._activity_body.addWidget(row)
 
     def _refresh_app_info(self) -> None:
         if self._settings:

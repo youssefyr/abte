@@ -8,6 +8,8 @@ import shutil
 
 from PySide6.QtCore import QSysInfo
 
+from app.services.slm.models import resolve_llama_binary
+
 
 @dataclass(slots=True)
 class LlamaRuntimeStatus:
@@ -35,7 +37,7 @@ class LlamaRuntimeDetector:
         checked: list[str] = []
 
         for name in cls.EXECUTABLE_NAMES:
-            path = shutil.which(name)
+            path = resolve_llama_binary(name)
             checked.append(f"PATH::{name}")
             if path:
                 return LlamaRuntimeStatus(

@@ -133,8 +133,12 @@ class ExtensionCoreHandler:
         self._write_cmd({"cmd": "clear_task", "ts": time.time()})
 
     def _write_cmd(self, payload: dict) -> None:
+        """Atomically write a command payload so the extension never reads a partial file."""
         try:
-            self._cmd_file.write_text(json.dumps(payload), encoding="utf-8")
+            import tempfile
+            tmp_path = self._cmd_file.with_suffix(".tmp")
+            tmp_path.write_text(json.dumps(payload), encoding="utf-8")
+            os.replace(str(tmp_path), str(self._cmd_file))
         except Exception as exc:
             logger.debug(f"ExtensionCoreHandler: failed to write cmd: {exc}")
 

@@ -82,7 +82,7 @@ class PlannerService:
             if task.status not in {'done', 'cancelled'} and (not allowed or task.id in allowed)
         ]
         result.sort(key=lambda task: (-int(task.priority), task.due_at or datetime.max, task.created_at or datetime.min))
-        return result[:30]
+        return result[:100]  # raised from 30 — OR-Tools CP-SAT handles 100 tasks within 1.5s budget
 
     def _all_tasks(self) -> list[TaskItem]:
         if hasattr(self.repository, 'all_tasks'):

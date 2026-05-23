@@ -33,8 +33,17 @@ class NotificationService:
             self.flush()
 
     def flush(self) -> None:
-        while self._queue:
-            kwargs = self._queue.pop(0)
+        """Flush queued notifications, deduplicating by (title, message) and capping at 3."""
+        seen: set[tuple[str, str]] = set()
+        deduplicated: list[dict] = []
+        for kwargs in self._queue:
+            key = (kwargs.get("title", ""), kwargs.get("message", ""))
+            if key not in seen:
+                seen.add(key)
+                deduplicated.append(kwargs)
+        self._queue = []
+        # Cap the flush batch to prevent burst spam after long suppression.
+        for kwargs in deduplicated[:3]:
             self._publish_immediate(**kwargs)
 
     def publish(
@@ -52,6 +61,30 @@ class NotificationService:
             raise ValueError("Notification title is required")
         if not message:
             raise ValueError("Notification message is required")
+
+        # Consecutive duplicate suppression (5.0s window)
+        import time
+        now_ts = time.time()
+        key = (title, message)
+        if hasattr(self, "_recent_published"):
+            self._recent_published = {k: t for k, t in self._recent_published.items() if now_ts - t < 5.0}
+        else:
+            self._recent_published = {}
+
+        if key in self._recent_published:
+            # Duplicate — suppress and return placeholder
+            return NotificationItem(
+                id=f"notif-dup-{uuid.uuid4().hex[:8]}",
+                title=title,
+                message=message,
+                level=level,
+                created_at=datetime.now(timezone.utc),
+                read_at=None,
+                action_key=action_key,
+                meta=meta or {},
+            )
+        self._recent_published[key] = now_ts
+
         kwargs = {
             "title": title,
             "message": message,

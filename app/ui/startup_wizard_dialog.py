@@ -7,7 +7,7 @@ from typing import Any
 import shutil
 import urllib.request
 
-from PySide6.QtCore import QEvent, Qt, QPropertyAnimation, Signal
+from PySide6.QtCore import QEvent, Qt, QPropertyAnimation, Signal, QThread
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -29,7 +29,8 @@ from PySide6.QtWidgets import (
 )
 
 from app.ui.animation_core import FadeScaleMixin, GalaxyBackdropWidget
-from app.ui.ui_helpers import ToggleSwitch, StepperSpinBox, make_button, make_card, make_label
+from app.ui.ui_helpers import ToggleSwitch, StepperSpinBox, make_button, make_card, make_label, PopupBaseDialog
+from app.ui.slm_model_selector import ModelSelectorWidget
 from app.models.llama_runtime import LlamaRuntimeDetector
 from app.core.llama_install_help import LlamaInstallGuideFactory, InstallGuide
 from app.services.slm import SlmService
@@ -46,7 +47,7 @@ DEFAULT_FACE_LANDMARKER_URL = (
 )
 
 @dataclass(slots=True)
-class StartupWizardDialog(QDialog, FadeScaleMixin):
+class StartupWizardDialog(PopupBaseDialog, FadeScaleMixin):
     setup_completed = Signal(dict)
 
     def __init__(
@@ -58,6 +59,11 @@ class StartupWizardDialog(QDialog, FadeScaleMixin):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        self.setWindowFlags(
+            Qt.WindowType.Dialog
+            | Qt.WindowType.WindowMinMaxButtonsHint
+            | Qt.WindowType.WindowCloseButtonHint
+        )
         self.metrics = metrics
         self.settings = settings
         self.repository = repository
@@ -67,11 +73,6 @@ class StartupWizardDialog(QDialog, FadeScaleMixin):
         self.setModal(True)
         self.setObjectName("StartupWizardDialog")
         self.setWindowTitle("ABTE setup")
-        self.setWindowFlags(
-            Qt.WindowType.Dialog
-            | Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowSystemMenuHint
-        )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.resize(980, 760)
         self.setMinimumSize(780, 620)
@@ -106,30 +107,18 @@ class StartupWizardDialog(QDialog, FadeScaleMixin):
         self.shell.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.shell.setMaximumWidth(980)
 
-        self.shell.setStyleSheet("""
-        QFrame#WizardShell {
-            background: rgba(9, 14, 28, 212);
-            border: 1px solid rgba(130, 180, 255, 48);
-            border-radius: 28px;
-        }
-        """)
-
         self.setObjectName("StartupWizardOverlay")
-        self.setStyleSheet("""
-        QDialog#StartupWizardOverlay,
-        QWidget#StartupWizardOverlayRoot,
-        QWidget#StartupWizardCenterHost {
-            background: transparent;
-            border: none;
-            color: #ECF6F1;
-        }
-        """)
+
+        # Layout to center self.shell horizontally while stretching vertically
+        hbox = QHBoxLayout()
+        hbox.setContentsMargins(0, 0, 0, 0)
+        hbox.addStretch(1)
+        hbox.addWidget(self.shell, 10)
+        hbox.addStretch(1)
 
         center_layout = QVBoxLayout(self.center_host)
-        center_layout.setContentsMargins(36, 36, 36, 36)
-        center_layout.addStretch(1)
-        center_layout.addWidget(self.shell, 0, Qt.AlignmentFlag.AlignHCenter)
-        center_layout.addStretch(1)
+        center_layout.setContentsMargins(24, 24, 24, 24)
+        center_layout.addLayout(hbox, 1)
 
         self.shell_opacity_effect = QGraphicsOpacityEffect(self.shell)
         self.shell_opacity_effect.setOpacity(1.0)
@@ -269,11 +258,56 @@ class StartupWizardDialog(QDialog, FadeScaleMixin):
         profile_layout.addWidget(self.goals_input)
         self.content_layout.addWidget(profile_card)
 
-        ai_card, ai_layout = make_card("Local model", "Download the GGUF model and enable local features.")
+        ai_card, ai_layout = make_card("Local model", "Select and download a GGUF model for local AI features.")
+
+        # ── Catalog selector (primary interface) ───────────────────────────────
+        self._model_selector = ModelSelectorWidget(self.settings, self)
+        self._model_selector.model_path_changed.connect(self._on_catalog_model_selected)
+        ai_layout.addWidget(self._model_selector)
+
+        # ── Manual / advanced override (hidden by default) ────────────────────
+        self._advanced_toggle_btn = make_button("▼ Advanced / custom model path", "ghost")
+        self._advanced_toggle_btn.setCheckable(True)
+        self._advanced_toggle_btn.setChecked(False)
+        self._advanced_toggle_btn.clicked.connect(self._toggle_advanced_model)
+        ai_layout.addWidget(self._advanced_toggle_btn)
+
+        self._advanced_model_widget = QWidget()
+        adv_layout = QVBoxLayout(self._advanced_model_widget)
+        adv_layout.setContentsMargins(0, 0, 0, 0)
+        adv_layout.setSpacing(8)
+        self._advanced_model_widget.setVisible(False)
+
         self.model_path_input = QLineEdit()
+        self.model_path_input.textChanged.connect(self._on_model_path_input_changed)
         self.download_url_input = QLineEdit()
         self.download_url_input.setText(DEFAULT_GGUF_URL)
 
+        adv_layout.addWidget(make_label("Model file path"))
+        adv_layout.addWidget(self.model_path_input)
+        adv_layout.addWidget(make_label("Download URL"))
+        adv_layout.addWidget(self.download_url_input)
+
+        tool_row_adv = QHBoxLayout()
+        self.default_path_btn = make_button("Use default path", "ghost")
+        self.default_path_btn.clicked.connect(self._fill_default_model_path)
+        tool_row_adv.addWidget(self.default_path_btn)
+        tool_row_adv.addStretch(1)
+        adv_layout.addLayout(tool_row_adv)
+
+        ai_layout.addWidget(self._advanced_model_widget)
+
+        # ── llama.cpp runtime detect ─────────────────────────────────────────
+        self.binary_status = make_label("", "muted", word_wrap=True)
+        self.detect_runtime_btn = make_button("Detect llama.cpp", "ghost")
+        self.detect_runtime_btn.clicked.connect(self._detect_runtime)
+        runtime_row = QHBoxLayout()
+        runtime_row.addWidget(self.detect_runtime_btn)
+        runtime_row.addStretch(1)
+        ai_layout.addLayout(runtime_row)
+        ai_layout.addWidget(self.binary_status)
+
+        # ── Feature toggles ───────────────────────────────────────────────────
         self.max_tokens = StepperSpinBox()
         self.max_tokens.setMinimum(128)
         self.max_tokens.setMaximum(2048)
@@ -281,16 +315,7 @@ class StartupWizardDialog(QDialog, FadeScaleMixin):
 
         self.coach_toggle = ToggleSwitch()
         self.decompose_toggle = ToggleSwitch()
-        self.binary_status = make_label("", "muted", word_wrap=True)
 
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 100)
-        self.progress.setValue(0)
-
-        ai_layout.addWidget(make_label("Model file path"))
-        ai_layout.addWidget(self.model_path_input)
-        ai_layout.addWidget(make_label("Download URL"))
-        ai_layout.addWidget(self.download_url_input)
         ai_layout.addWidget(make_label("Max tokens"))
         ai_layout.addWidget(self.max_tokens)
 
@@ -306,21 +331,11 @@ class StartupWizardDialog(QDialog, FadeScaleMixin):
         decompose_row.addWidget(self.decompose_toggle)
         ai_layout.addLayout(decompose_row)
 
+        # Download progress (used by _download_model fallback)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
         ai_layout.addWidget(self.progress)
-        ai_layout.addWidget(self.binary_status)
-
-        tool_row = QHBoxLayout()
-        self.default_path_btn = make_button("Use default path", "ghost")
-        self.default_path_btn.clicked.connect(self._fill_default_model_path)
-
-        self.detect_runtime_btn = make_button("Detect llama.cpp", "ghost")
-        self.detect_runtime_btn.clicked.connect(self._detect_runtime)
-
-        tool_row.addWidget(self.default_path_btn)
-        tool_row.addWidget(self.detect_runtime_btn)
-        tool_row.addStretch(1)
-        ai_layout.addLayout(tool_row)
-
         self.install_help_title = make_label("Install help", "cardTitle")
         self.install_help_summary = make_label(
             "OS-specific llama.cpp setup steps will appear here when runtime detection fails.",
@@ -347,11 +362,45 @@ class StartupWizardDialog(QDialog, FadeScaleMixin):
             word_wrap=True,
         )
 
+        # ── Feasibility pre-check section ─────────────────────────────────
+        self.feasibility_label = make_label(
+            "System check: click 'Run benchmark' to assess your hardware.",
+            "muted",
+            word_wrap=True,
+        )
+
+        # Alternative models table (shown only when primary model is not safe)
+        self.alternatives_table = QTableWidget(0, 3)
+        self.alternatives_table.setHorizontalHeaderLabels(["Model", "RAM needed", "Description"])
+        self.alternatives_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.alternatives_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.alternatives_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.alternatives_table.verticalHeader().setVisible(False)
+        self.alternatives_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.alternatives_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.alternatives_table.setMinimumHeight(90)
+        self.alternatives_table.setVisible(False)
+        self.alternatives_table.setToolTip("Click a row, then click 'Use selected model' to switch download URL")
+
+        self.use_alternative_btn = make_button("Use selected model", "ghost")
+        self.use_alternative_btn.setVisible(False)
+        self.use_alternative_btn.clicked.connect(self._apply_selected_alternative)
+        self._feasibility_alternatives: list = []  # cache for SafeModelOption list
+
+        alts_row = QHBoxLayout()
+        alts_row.addWidget(self.use_alternative_btn)
+        alts_row.addStretch(1)
+
         benchmark_actions = QHBoxLayout()
         self.run_benchmark_btn = make_button("Run benchmark", "secondary")
         self.run_benchmark_btn.clicked.connect(self._run_benchmark)
+        self.force_benchmark_btn = make_button("Run anyway", "ghost")
+        self.force_benchmark_btn.clicked.connect(self._force_run_benchmark)
+        self.force_benchmark_btn.setVisible(False)
+        self.force_benchmark_btn.setToolTip("Run benchmark even if system check indicates it may fail")
 
         benchmark_actions.addWidget(self.run_benchmark_btn)
+        benchmark_actions.addWidget(self.force_benchmark_btn)
         benchmark_actions.addStretch(1)
 
         self.benchmark_table = QTableWidget(0, 4)
@@ -364,6 +413,9 @@ class StartupWizardDialog(QDialog, FadeScaleMixin):
 
         ai_layout.addWidget(self.benchmark_summary_label)
         ai_layout.addWidget(self.planner_label)
+        ai_layout.addWidget(self.feasibility_label)
+        ai_layout.addWidget(self.alternatives_table)
+        ai_layout.addLayout(alts_row)
         ai_layout.addLayout(benchmark_actions)
         ai_layout.addWidget(self.benchmark_table)
 
@@ -426,8 +478,31 @@ class StartupWizardDialog(QDialog, FadeScaleMixin):
         self.content_layout.addWidget(dev_card)
         self.content_layout.addStretch(1)
 
+    def _toggle_advanced_model(self, checked: bool) -> None:
+        self._advanced_model_widget.setVisible(checked)
+        self._advanced_toggle_btn.setText(
+            "\u25b2 Advanced / custom model path" if checked else "\u25bc Advanced / custom model path"
+        )
+
+    def _on_catalog_model_selected(self, model_path: str) -> None:
+        """Sync the hidden path input when the catalog selector activates a model."""
+        self.model_path_input.setText(model_path)
+
+    def _on_model_path_input_changed(self, text: str) -> None:
+        """Sync to setting and refresh catalog when model path text changes."""
+        self.settings.set("SLM/model_path", text.strip())
+        self.settings.sync()
+        if hasattr(self, "_model_selector"):
+            self._model_selector.refresh()
+        self._check_model_downloaded()
+
     def _default_model_path(self) -> Path:
-        return self.settings.app_data_dir() / "models" / "phi3-mini-4k-instruct-q4.gguf"
+        from app.services.slm.model_catalog import KNOWN_MODELS, find_downloaded_model
+        for entry in KNOWN_MODELS:
+            found = find_downloaded_model(entry, self.settings.app_data_dir())
+            if found:
+                return found
+        return self.settings.app_data_dir() / "models" / "Phi-3-mini-4k-instruct-q4.gguf"
 
     def _default_face_model_path(self) -> Path:
         return self.settings.app_data_dir() / "models" / "face_landmarker.task"
@@ -579,8 +654,20 @@ class StartupWizardDialog(QDialog, FadeScaleMixin):
     def _load_from_settings(self) -> None:
         self.name_input.setText(str(self.settings.get("Profile/display_name", "") or ""))
         self.goals_input.setText(str(self.settings.get("Profile/current_goals", "") or ""))
+        
+        current_path = self.settings.get("SLM/model_path", "")
+        if not current_path or not Path(current_path).exists():
+            from app.services.slm.model_catalog import KNOWN_MODELS, find_downloaded_model
+            for entry in KNOWN_MODELS:
+                found = find_downloaded_model(entry, self.settings.app_data_dir())
+                if found:
+                    current_path = str(found)
+                    self.settings.set("SLM/model_path", current_path)
+                    self.settings.sync()
+                    break
+
         self.model_path_input.setText(
-            str(self.settings.get("SLM/model_path", str(self._default_model_path())) or "")
+            str(current_path or self._default_model_path())
         )
         self.max_tokens.setValue(int(self.settings.get("SLM/max_tokens", 512) or 512))
         self.coach_toggle.setChecked(bool(self.settings.get("SLM/coach_enabled", False)))
@@ -688,25 +775,146 @@ class StartupWizardDialog(QDialog, FadeScaleMixin):
         self.benchmark_summary_label.setText(self.slm_service.describe_benchmark_summary())
 
     def _run_benchmark(self) -> None:
+        """Run system feasibility check first, then launch benchmark if safe."""
         self.run_benchmark_btn.setEnabled(False)
-        self.status_label.setText("Running local SLM benchmark. This may take a while.")
-        self.progress.setRange(0, 0)
+        self.force_benchmark_btn.setVisible(False)
+        self.status_label.setText("Checking system compatibility...")
 
-        try:
-            results = self.slm_service.benchmark_runtime()
-            self.benchmark_table.setRowCount(0)
-            for row_idx, item in enumerate(results):
-                self.benchmark_table.insertRow(row_idx)
-                self.benchmark_table.setItem(row_idx, 0, QTableWidgetItem(str(item.get("target", ""))))
-                self.benchmark_table.setItem(row_idx, 1, QTableWidgetItem(str(item.get("duration_seconds", ""))))
-                self.benchmark_table.setItem(row_idx, 2, QTableWidgetItem("Yes" if item.get("success") else "No"))
-                self.benchmark_table.setItem(row_idx, 3, QTableWidgetItem(str(item.get("reason", ""))))
-            self.status_label.setText("Benchmark completed.")
-            self._refresh_benchmark_ui()
-        except Exception as exc:
-            self.status_label.setText(f"Benchmark failed: {exc}")
-        finally:
-            self.progress.setRange(0, 100)
-            if self.progress.value() == 0:
-                self.progress.setValue(100)
+        feasibility = self.slm_service.assess_system_feasibility()
+        if feasibility is None:
+            self.status_label.setText("No model configuration found. Set a model path first.")
             self.run_benchmark_btn.setEnabled(True)
+            return
+
+        # Show feasibility result
+        self._update_feasibility_ui(feasibility)
+
+        if not feasibility.primary_model_safe:
+            # Don't start benchmark automatically — let user decide
+            self.run_benchmark_btn.setEnabled(True)
+            self.force_benchmark_btn.setVisible(True)
+            return
+
+        self._start_benchmark_run()
+
+    def _force_run_benchmark(self) -> None:
+        """Run benchmark regardless of feasibility warnings."""
+        self.force_benchmark_btn.setVisible(False)
+        self._start_benchmark_run()
+
+    def _update_feasibility_ui(self, feasibility) -> None:
+        """Update feasibility label and alternatives table."""
+        icon = "✓" if feasibility.primary_model_safe else "⚠"
+        color_hint = "" if feasibility.primary_model_safe else " — lightweight alternatives shown below"
+        text = f"{icon} {feasibility.summary}{color_hint}"
+        if feasibility.warnings:
+            text += "\n" + "\n".join(f"  • {w}" for w in feasibility.warnings)
+        self.feasibility_label.setText(text)
+
+        self._feasibility_alternatives = feasibility.safe_alternatives
+        self.alternatives_table.setRowCount(0)
+
+        if not feasibility.primary_model_safe and feasibility.safe_alternatives:
+            self.alternatives_table.setVisible(True)
+            self.use_alternative_btn.setVisible(True)
+            for idx, alt in enumerate(feasibility.safe_alternatives):
+                self.alternatives_table.insertRow(idx)
+                self.alternatives_table.setItem(idx, 0, QTableWidgetItem(alt.name))
+                self.alternatives_table.setItem(idx, 1, QTableWidgetItem(f"{alt.ram_required_mb} MB"))
+                self.alternatives_table.setItem(idx, 2, QTableWidgetItem(alt.description))
+        else:
+            self.alternatives_table.setVisible(False)
+            self.use_alternative_btn.setVisible(False)
+
+    def _apply_selected_alternative(self) -> None:
+        """Switch the download URL and model path to the selected alternative."""
+        row = self.alternatives_table.currentRow()
+        if row < 0 or row >= len(self._feasibility_alternatives):
+            return
+        alt = self._feasibility_alternatives[row]
+        self.download_url_input.setText(alt.download_url)
+        # Derive a filename from the URL and use the default models directory
+        filename = alt.download_url.rsplit("/", 1)[-1] or "model.gguf"
+        new_path = self.settings.app_data_dir() / "models" / filename
+        self.model_path_input.setText(str(new_path))
+        self.status_label.setText(
+            f"Switched to {alt.name}. Click 'Download model' to fetch it, then run the benchmark."
+        )
+        self.force_benchmark_btn.setVisible(False)
+
+    def _start_benchmark_run(self) -> None:
+        """Internal: run the actual benchmark candidates."""
+        self.run_benchmark_btn.setEnabled(False)
+        self.status_label.setText("Preparing benchmark candidates...")
+
+        candidates = self.slm_service.get_benchmark_candidates()
+        if not candidates:
+            self.status_label.setText("No benchmark candidates available. Verify model exists.")
+            self.run_benchmark_btn.setEnabled(True)
+            return
+
+        self.benchmark_table.setRowCount(0)
+        for row_idx, cand in enumerate(candidates):
+            self.benchmark_table.insertRow(row_idx)
+            self.benchmark_table.setItem(row_idx, 0, QTableWidgetItem(cand.target))
+            self.benchmark_table.setItem(row_idx, 1, QTableWidgetItem("Pending..."))
+            self.benchmark_table.setItem(row_idx, 2, QTableWidgetItem("Pending..."))
+            self.benchmark_table.setItem(row_idx, 3, QTableWidgetItem(cand.reason))
+
+        self.status_label.setText("Running local SLM benchmark one-by-one. This will not freeze your UI.")
+        self.progress.setRange(0, len(candidates))
+        self.progress.setValue(0)
+        self._completed_count = 0
+
+        self._benchmark_worker = BenchmarkWorker(self.slm_service, self)
+
+        def on_candidate_finished(item):
+            for row in range(self.benchmark_table.rowCount()):
+                if self.benchmark_table.item(row, 0).text() == item.get("target"):
+                    self.benchmark_table.setItem(row, 1, QTableWidgetItem(f"{item.get('duration_seconds')}s"))
+                    self.benchmark_table.setItem(row, 2, QTableWidgetItem("Yes" if item.get("success") else "No"))
+                    self.benchmark_table.setItem(row, 3, QTableWidgetItem(str(item.get("error") or item.get("reason", ""))))
+                    break
+            self._completed_count += 1
+            self.progress.setValue(self._completed_count)
+            self.status_label.setText(f"Completed benchmark: {item.get('target')} in {item.get('duration_seconds')}s")
+
+        def on_finished(results):
+            self.status_label.setText("Benchmark completed successfully.")
+            self._refresh_benchmark_ui()
+            self.progress.setRange(0, 100)
+            self.progress.setValue(100)
+            self.run_benchmark_btn.setEnabled(True)
+
+        def on_error(err):
+            self.status_label.setText(f"Benchmark failed: {err}")
+            self.progress.setRange(0, 100)
+            self.progress.setValue(100)
+            self.run_benchmark_btn.setEnabled(True)
+
+        self._benchmark_worker.candidate_finished.connect(on_candidate_finished)
+        self._benchmark_worker.finished_all.connect(on_finished)
+        self._benchmark_worker.error_occurred.connect(on_error)
+        self._benchmark_worker.start()
+
+
+class BenchmarkWorker(QThread):
+    candidate_finished = Signal(dict)
+    finished_all = Signal(list)
+    error_occurred = Signal(str)
+
+    def __init__(self, slm_service: SlmService, parent=None) -> None:
+        super().__init__(parent)
+        self.slm_service = slm_service
+
+    def run(self) -> None:
+        try:
+            candidates = self.slm_service.get_benchmark_candidates()
+            results = []
+            for candidate in candidates:
+                res = self.slm_service.run_single_benchmark_candidate(candidate)
+                results.append(res)
+                self.candidate_finished.emit(res)
+            self.finished_all.emit(results)
+        except Exception as e:
+            self.error_occurred.emit(str(e))

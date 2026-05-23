@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 import uuid
 
@@ -59,7 +59,9 @@ class LiveFocusSnapshot:
 
 
 class FocusSmoother:
-    def __init__(self, max_minutes: int = 60, ema_alpha: float | None = 0.15) -> None:
+    def __init__(self, max_minutes: int = 60, ema_alpha: float | None = 0.15, bucket_minutes: int | None = None) -> None:
+        if bucket_minutes is not None:
+            max_minutes = bucket_minutes
         self._max_minutes = max(1, max_minutes)
         self._ema_alpha = ema_alpha
         self._minute_buckets: deque[MinuteBucket] = deque(maxlen=self._max_minutes)
@@ -77,7 +79,9 @@ class FocusSmoother:
         if self._open_bucket is not None:
             self._open_bucket.session_id = session_id
 
-    def end_session(self, now: datetime) -> float | None:
+    def end_session(self, now: datetime | None = None) -> float | None:
+        if now is None:
+            now = datetime.now(timezone.utc)
         closed = self.flush(now)
         if closed and closed.session_id == self._current_session_id:
             self._session_bucket_sum += (1.0 - closed.p_drift_mean)
@@ -92,7 +96,13 @@ class FocusSmoother:
         self._session_bucket_count = 0
         return value
 
-    def update(self, raw_p: float, now: datetime) -> MinuteBucket | None:
+    def update(self, raw_p: float | None = None, now: datetime | None = None, p_drift: float | None = None) -> MinuteBucket | None:
+        if raw_p is None and p_drift is not None:
+            raw_p = p_drift
+        if raw_p is None:
+            raw_p = 0.5
+        if now is None:
+            now = datetime.now(timezone.utc)
         minute_key = now.replace(second=0, microsecond=0)
 
         if self._open_bucket is None:

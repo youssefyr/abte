@@ -234,12 +234,16 @@ class PlannerPage(BasePage):
             for label in self.labels_to_search:
                 if label is None or not isValid(label):
                     continue
-                label.setStyleSheet("")
+                label.setProperty("highlighted", False)
+                label.style().unpolish(label)
+                label.style().polish(label)
             return
         for label in self.labels_to_search:
             if label is None or not isValid(label):
                 continue
             elif text in label.text().lower():
-                label.setStyleSheet(f'color: {self.palette().color(QPalette.ColorRole.HighlightedText).name()}; background-color: {self.palette().color(QPalette.ColorRole.Highlight).name()}; border-radius: 4px;')
+                label.setProperty("highlighted", True)
             else:
-                label.setStyleSheet("")
+                label.setProperty("highlighted", False)
+            label.style().unpolish(label)
+            label.style().polish(label)

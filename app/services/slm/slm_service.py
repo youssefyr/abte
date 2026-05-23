@@ -7,9 +7,26 @@ from typing import Any
 import json
 import shutil
 import subprocess
+import os
+import sys
+import signal
+import time
+import threading
+import selectors
+import queue
+from PySide6.QtCore import QThread
+
+from .models import resolve_llama_binary
 
 from .benchmark_store import BenchmarkStore
-from .hardware_planner import plan_execution, prompt_bucket_for, sample_cpu, sample_gpu
+from .hardware_planner import (
+    assess_feasibility,
+    plan_execution,
+    prompt_bucket_for,
+    sample_cpu,
+    sample_gpu,
+    SystemFeasibilityResult,
+)
 from .models import (
     BackEnd,
     BenchmarkSummary,
@@ -27,6 +44,25 @@ from .parser_utils import (
 )
 
 
+class AsynchronousFileReader(threading.Thread):
+    def __init__(self, fd: Any, q: queue.Queue[str]) -> None:
+        super().__init__()
+        self._fd = fd
+        self._queue = q
+        self.daemon = True
+
+    def run(self) -> None:
+        try:
+            while True:
+                # Read chunks of text
+                chunk = self._fd.read(1024)
+                if not chunk:
+                    break
+                self._queue.put(chunk)
+        except Exception:
+            pass
+
+
 class SlmService:
     def __init__(self, settings: Any, repository: Any) -> None:
         self._settings = settings
@@ -34,6 +70,37 @@ class SlmService:
         self._last_plan: RuntimeExecutionPlan | None = None
         self._last_diagnostics: PlannerDiagnostics | None = None
         self._benchmark_store = BenchmarkStore(self._settings.app_data_dir() / "slm")
+        self._supported_flags_cache: dict[str, dict[str, bool]] = {}
+        self._active_processes: set[subprocess.Popen] = set()
+        self._process_lock = threading.Lock()
+
+    def _register_process(self, process: subprocess.Popen) -> None:
+        with self._process_lock:
+            self._active_processes.add(process)
+
+    def _unregister_process(self, process: subprocess.Popen) -> None:
+        with self._process_lock:
+            self._active_processes.discard(process)
+
+    def _terminate_process(self, process: subprocess.Popen) -> None:
+        try:
+            if sys.platform.startswith("win"):
+                process.kill()
+            else:
+                pgid = os.getpgid(process.pid)
+                os.killpg(pgid, signal.SIGKILL)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+
+    def stop(self) -> None:
+        """Forcefully terminate all active llama.cpp subprocesses during application exit or worker termination."""
+        with self._process_lock:
+            processes = list(self._active_processes)
+        for process in processes:
+            self._terminate_process(process)
 
     @property
     def last_plan(self) -> RuntimeExecutionPlan | None:
@@ -48,6 +115,16 @@ class SlmService:
 
     def current_config(self) -> SlmConfig | None:
         model_raw = str(self._settings.get("SLM/model_path", "") or "").strip()
+        if not model_raw or not Path(model_raw).exists():
+            from .model_catalog import KNOWN_MODELS, find_downloaded_model
+            for entry in KNOWN_MODELS:
+                found = find_downloaded_model(entry, self._settings.app_data_dir())
+                if found:
+                    model_raw = str(found)
+                    self._settings.set("SLM/model_path", model_raw)
+                    self._settings.sync()
+                    break
+
         if not model_raw:
             return None
 
@@ -108,7 +185,7 @@ class SlmService:
             f"Runs: {summary.record_count}"
         )
 
-    def benchmark_runtime(self, *, prompt: str | None = None) -> list[dict[str, Any]]:
+    def get_benchmark_candidates(self, *, prompt: str | None = None) -> list[RuntimeExecutionPlan]:
         cfg = self.current_config()
         if cfg is None or not cfg.model_path.exists():
             return []
@@ -167,12 +244,28 @@ class SlmService:
         for candidate in candidates:
             deduped[(candidate.target, candidate.llama_gpu_layers)] = candidate
 
-        results: list[dict[str, Any]] = []
-        for candidate in deduped.values():
-            result = self._benchmark_single_plan(cfg, prompt_text, candidate)
-            results.append(result)
+        return list(deduped.values())
 
+    def run_single_benchmark_candidate(
+        self,
+        candidate: RuntimeExecutionPlan,
+        *,
+        prompt: str | None = None,
+    ) -> dict[str, Any]:
+        cfg = self.current_config()
+        if cfg is None or not cfg.model_path.exists():
+            return {}
+        prompt_text = prompt or self._benchmark_prompt(cfg)
+        result = self._benchmark_single_plan(cfg, prompt_text, candidate)
         self._save_benchmark_summary_to_settings()
+        return result
+
+    def benchmark_runtime(self, *, prompt: str | None = None) -> list[dict[str, Any]]:
+        candidates = self.get_benchmark_candidates(prompt=prompt)
+        results: list[dict[str, Any]] = []
+        for candidate in candidates:
+            res = self.run_single_benchmark_candidate(candidate, prompt=prompt)
+            results.append(res)
         return results
 
     def _save_benchmark_summary_to_settings(self) -> None:
@@ -299,6 +392,19 @@ class SlmService:
         cfg = self.current_config()
         return bool(cfg and cfg.model_path.exists())
 
+    def assess_system_feasibility(self) -> SystemFeasibilityResult | None:
+        """
+        Run a pre-benchmark system assessment.
+
+        Returns None if no SLM config is set. Otherwise returns a
+        SystemFeasibilityResult describing whether the configured model is
+        safe to benchmark and listing lighter alternatives for constrained systems.
+        """
+        cfg = self.current_config()
+        if cfg is None:
+            return None
+        return assess_feasibility(cfg)
+
     def decompose_task(
         self,
         *,
@@ -338,7 +444,7 @@ class SlmService:
             energy_cost=energy_cost,
             current_focus_score=current_focus_score,
         )
-        raw = self._run_llm(prompt, cfg)
+        raw = self._run_llm(prompt, cfg, task_type="decomposition")
         if raw:
             parsed = parse_json_list(raw)
             normalized = [normalize_task_draft(item) for item in parsed]
@@ -371,7 +477,7 @@ class SlmService:
 
         if cfg is not None and cfg.decomposition_enabled and cfg.model_path.exists():
             prompt = self._build_nl_task_prompt(cfg, raw_text, tags)
-            raw = self._run_llm(prompt, cfg)
+            raw = self._run_llm(prompt, cfg, task_type="decomposition")
             if raw:
                 parsed = parse_json_list(raw)
                 normalized = [normalize_task_draft(item) for item in parsed]
@@ -389,7 +495,7 @@ class SlmService:
         if not goal:
             return []
         prompt = self._build_decomposition_prompt(goal, cfg)
-        raw = self._run_llm(prompt, cfg)
+        raw = self._run_llm(prompt, cfg, task_type="decomposition")
         if not raw:
             return []
         return self._parse_decomposition(raw)
@@ -477,7 +583,8 @@ class SlmService:
             return ""
         stats = self.build_weekly_stats(week_start, week_end)
         prompt = self._build_weekly_review_prompt(stats, cfg)
-        review = self._run_llm(prompt, cfg).strip()
+        # Optimization for low end systems
+        review = self._run_llm(prompt, cfg, is_weekly_review=True, task_type="weekly_review").strip()
         if review:
             start_dt = datetime.combine(week_start, datetime.min.time(), tzinfo=UTC)
             end_dt = datetime.combine(week_end, datetime.max.time(), tzinfo=UTC)
@@ -502,7 +609,16 @@ class SlmService:
             "current_goals": cfg.current_goals,
             "goal": goal,
         }
-        
+        return (
+            "You are a supportive productivity assistant. "
+            "You are not a therapist, clinician, or medical advisor. "
+            "Break the user's goal into small actionable tasks. "
+            "Return only valid JSON using this schema: "
+            "{\"items\": [{\"title\": str, \"description\": str, \"estimated_minutes\": int, \"tags\": [str], \"energy_cost\": int}]}. "
+            "Use 3 to 8 tasks. Estimated minutes must be between 5 and 240. Energy cost must be 1 to 5.\n"
+            f"Input: {json.dumps(payload, ensure_ascii=False)}"
+        )
+
     def categorize_distractions(self, window_titles: list[str]) -> dict[str, str]:
         cfg = self.current_config()
         if cfg is None or not cfg.model_path.exists() or not window_titles:
@@ -515,7 +631,7 @@ class SlmService:
             "Return JSON only.\n"
             f"Input: {json.dumps(payload, ensure_ascii=False)}"
         )
-        raw = self._run_llm(prompt, cfg)
+        raw = self._run_llm(prompt, cfg, task_type="classification")
         if not raw:
             return {}
             
@@ -560,7 +676,7 @@ class SlmService:
             f"Input: {json.dumps(payload, ensure_ascii=False)}"
         )
         
-        raw = self._run_llm(prompt, cfg)
+        raw = self._run_llm(prompt, cfg, task_type="scheduling")
         if not raw:
             return []
             
@@ -576,16 +692,6 @@ class SlmService:
         except Exception:
             pass
         return []
-
-        return (
-            "You are a supportive productivity assistant. "
-            "You are not a therapist, clinician, or medical advisor. "
-            "Break the user's goal into small actionable tasks. "
-            "Return only valid JSON using this schema: "
-            "{\"items\": [{\"title\": str, \"description\": str, \"estimated_minutes\": int, \"tags\": [str], \"energy_cost\": int}]}. "
-            "Use 3 to 8 tasks. Estimated minutes must be between 5 and 240. Energy cost must be 1 to 5.\n"
-            f"Input: {json.dumps(payload, ensure_ascii=False)}"
-        )
 
     def _build_structured_task_decomposition_prompt(
         self,
@@ -678,46 +784,140 @@ class SlmService:
             f"Stats: {json.dumps(payload, ensure_ascii=False)}"
         )
 
-    def _run_llm(self, prompt: str, cfg: SlmConfig) -> str:
+    def _run_llm(self, prompt: str, cfg: SlmConfig, is_weekly_review: bool = False, task_type: str = "standard") -> str:
         diagnostics = plan_execution(cfg, prompt, self._benchmark_store)
         self._last_diagnostics = diagnostics
         self._last_plan = diagnostics.plan
 
         if cfg.backend == "onnx_runtime":
-            return self._run_onnx_runtime(prompt, cfg, diagnostics.plan)
+            raw = self._run_onnx_runtime(prompt, cfg, diagnostics.plan)
+        else:
+            # Optimization for low end systems
+            raw = self._run_llama_cpp(
+                prompt,
+                cfg,
+                diagnostics.plan,
+                is_weekly_review=is_weekly_review,
+                task_type=task_type,
+            )
 
-        return self._run_llama_cpp(prompt, cfg, diagnostics.plan)
+        return self._clean_thinking_tags(raw)
+
+    def _clean_thinking_tags(self, text: str) -> str:
+        if not text:
+            return ""
+        
+        import re
+        # Strip [Start thinking]...[End thinking] (case-insensitive, dotall)
+        text = re.sub(r"\[Start thinking\].*?\[End thinking\]", "", text, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r"\[thinking\].*?\[End thinking\]", "", text, flags=re.IGNORECASE | re.DOTALL)
+        
+        # Strip <thought>...</thought> (case-insensitive, dotall)
+        text = re.sub(r"<thought>.*?</thought>", "", text, flags=re.IGNORECASE | re.DOTALL)
+        # Strip <thinking>...</thinking>
+        text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.IGNORECASE | re.DOTALL)
+        
+        # Strip any open-ended [Start thinking], [thinking], <thought> or <thinking> to the end of the text
+        text = re.sub(r"\[Start thinking\].*", "", text, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r"\[thinking\].*", "", text, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r"<thought>.*", "", text, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r"<thinking>.*", "", text, flags=re.IGNORECASE | re.DOTALL)
+        
+        # Strip speed stats like "[ Prompt: 8.8 t/s | Generation: 5.9 t/s ]" or similar metrics
+        text = re.sub(r"\[\s*Prompt:.*?Generation:.*?\]", "", text, flags=re.IGNORECASE | re.DOTALL)
+        
+        return text.strip()
 
     def _run_onnx_runtime(self, prompt: str, cfg: SlmConfig, plan: RuntimeExecutionPlan) -> str:
-        try:
-            import onnxruntime as ort  # type: ignore
-        except Exception:
-            return ""
+        """ONNX backend is not yet implemented. Returns empty string.
 
-        if not cfg.model_path.exists():
-            return ""
-
-        provider = plan.onnx_provider or "CPUExecutionProvider"
-        try:
-            session = ort.InferenceSession(str(cfg.model_path), providers=[provider])
-        except Exception:
-            try:
-                session = ort.InferenceSession(str(cfg.model_path), providers=["CPUExecutionProvider"])
-            except Exception:
-                return ""
-
-        _ = (session, prompt)
+        The ONNX backend requires a tokenizer + autoregressive generation loop
+        that is not yet shipped. Users should configure backend=llama_cpp instead.
+        This stub is retained so the backend selector in settings can exist without
+        crashing, but it will never produce output.
+        """
+        _ = (prompt, cfg, plan)
         return ""
 
-    def _run_llama_cpp(self, prompt: str, cfg: SlmConfig, plan: RuntimeExecutionPlan) -> str:
+    def _run_llama_cpp(
+        self,
+        prompt: str,
+        cfg: SlmConfig,
+        plan: RuntimeExecutionPlan,
+        is_weekly_review: bool = False,
+        task_type: str = "standard",
+    ) -> str:
         if not cfg.model_path.exists():
             return ""
 
-        binary = shutil.which("llama-cli") or shutil.which("main") or shutil.which("llama")
+        binary = (
+            resolve_llama_binary("llama-cli")
+            or resolve_llama_binary("main")
+            or resolve_llama_binary("llama")
+        )
         if not binary:
             return ""
 
-        cmd = [binary, "-m", str(cfg.model_path), "-p", prompt, "-n", str(cfg.max_tokens)]
+        # Optimization for low end systems
+        from .model_catalog import detect_entry_for_path
+        entry = detect_entry_for_path(cfg.model_path)
+        is_thinking_model = entry is not None and "thinking" in entry.tags
+
+        is_low_end = False
+        try:
+            import psutil
+            is_low_end = (psutil.cpu_count(logical=True) or 4) <= 4
+        except Exception:
+            pass
+
+        if is_weekly_review or task_type == "weekly_review":
+            context_size = 3072 if is_thinking_model else 2048
+            max_tokens = 1536 if is_thinking_model else 1024
+            timeout = 300 if is_thinking_model else 180
+            reasoning_budget = 384 if is_low_end else 768
+        elif task_type in ("decomposition", "scheduling"):
+            context_size = 1536 if is_thinking_model else 512
+            max_tokens = 768 if is_thinking_model else cfg.max_tokens
+            timeout = 180 if is_thinking_model else max(30, int(cfg.planner_timeout_ms / 1000) + 120)
+            reasoning_budget = 64 if is_low_end else 256
+        elif task_type == "classification":
+            context_size = 1536 if is_thinking_model else 512
+            max_tokens = 768 if is_thinking_model else cfg.max_tokens
+            timeout = 180 if is_thinking_model else max(30, int(cfg.planner_timeout_ms / 1000) + 120)
+            reasoning_budget = 0
+        else:
+            context_size = 1536 if is_thinking_model else 512
+            max_tokens = 768 if is_thinking_model else cfg.max_tokens
+            timeout = 180 if is_thinking_model else max(30, int(cfg.planner_timeout_ms / 1000) + 120)
+            reasoning_budget = 64 if is_low_end else 128
+
+        cmd = [binary, "-m", str(cfg.model_path), "-p", prompt, "-n", str(max_tokens), "-c", str(context_size)]
+
+        # Check if the binary supports newer flags to avoid breaking older llama/main binaries
+        binary_key = str(binary)
+        if binary_key not in self._supported_flags_cache:
+            try:
+                res = subprocess.run([binary, "-h"], capture_output=True, text=True, timeout=5)
+                help_text = (res.stdout or "") + (res.stderr or "")
+                self._supported_flags_cache[binary_key] = {
+                    "no-cnv": "-no-cnv" in help_text or "--no-conversation" in help_text,
+                    "no-display-prompt": "--no-display-prompt" in help_text,
+                }
+            except Exception:
+                self._supported_flags_cache[binary_key] = {
+                    "no-cnv": False,
+                    "no-display-prompt": False,
+                }
+
+        flags = self._supported_flags_cache[binary_key]
+        if flags.get("no-cnv"):
+            cmd.append("-no-cnv")
+        if flags.get("no-display-prompt"):
+            cmd.append("--no-display-prompt")
+
+        if is_thinking_model:
+            cmd.extend(["--reasoning-budget", str(reasoning_budget)])
+            cmd.extend(["--reasoning-budget-message", "\n[Reasoning budget reached, continuing with the final output]\n"])
 
         if plan.cpu_threads is not None:
             cmd.extend(["-t", str(plan.cpu_threads)])
@@ -725,21 +925,92 @@ class SlmService:
         if plan.llama_gpu_layers != 0:
             cmd.extend(["-ngl", str(plan.llama_gpu_layers)])
 
+        popen_kwargs = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+        }
+        if not sys.platform.startswith("win"):
+            popen_kwargs["preexec_fn"] = os.setsid
+
+        process = None
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=max(30, int(cfg.planner_timeout_ms / 1000) + 120),
-                check=False,
-            )
+            process = subprocess.Popen(cmd, **popen_kwargs)
+            self._register_process(process)
+
+            stdout_queue = queue.Queue()
+            stderr_queue = queue.Queue()
+
+            stdout_reader = AsynchronousFileReader(process.stdout, stdout_queue)
+            stdout_reader.start()
+            stderr_reader = AsynchronousFileReader(process.stderr, stderr_queue)
+            stderr_reader.start()
+
+            stdout_chunks = []
+            stderr_chunks = []
+
+            t_start = time.perf_counter()
+            cancelled = False
+
+            while process.poll() is None:
+                current_thread = QThread.currentThread()
+                current_thread_id = threading.get_ident()
+                
+                from app.services.slm.slm_async import _CANCELLED_THREADS, _CANCELLED_THREADS_LOCK
+                is_cancelled_by_registry = False
+                with _CANCELLED_THREADS_LOCK:
+                    if current_thread_id in _CANCELLED_THREADS:
+                        is_cancelled_by_registry = True
+
+                if getattr(current_thread, "_cancelled", False) or is_cancelled_by_registry:
+                    cancelled = True
+                    break
+
+                if time.perf_counter() - t_start > timeout:
+                    break
+
+                # Drain reader queues
+                while not stdout_queue.empty():
+                    try:
+                        stdout_chunks.append(stdout_queue.get_nowait())
+                    except queue.Empty:
+                        break
+                while not stderr_queue.empty():
+                    try:
+                        stderr_chunks.append(stderr_queue.get_nowait())
+                    except queue.Empty:
+                        break
+
+                time.sleep(0.05)
+
+            # Final drain of remaining output
+            while not stdout_queue.empty():
+                try:
+                    stdout_chunks.append(stdout_queue.get_nowait())
+                except queue.Empty:
+                    break
+            while not stderr_queue.empty():
+                try:
+                    stderr_chunks.append(stderr_queue.get_nowait())
+                except queue.Empty:
+                    break
+
+            if cancelled or process.poll() is None:
+                self._terminate_process(process)
+                return ""
+
+            if process.returncode != 0:
+                return ""
+
+            return "".join(stdout_chunks).strip()
+
         except Exception:
+            if process:
+                self._terminate_process(process)
             return ""
-
-        if result.returncode != 0:
-            return ""
-
-        return result.stdout.strip()
+        finally:
+            if process:
+                self._unregister_process(process)
 
     def _parse_decomposition(self, raw: str) -> list[DecomposedTask]:
         text = raw.strip()

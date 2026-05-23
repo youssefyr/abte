@@ -7,7 +7,7 @@ from pathlib import Path
 
 # ── Logging must be configured before any app imports ─────────────────────
 from app.core.logging_config import setup_logging
-from PySide6.QtCore import QCoreApplication, QStandardPaths
+from PySide6.QtCore import QCoreApplication, QStandardPaths, Qt
 from PySide6.QtWidgets import QApplication
 
 
@@ -66,6 +66,11 @@ def main() -> int:
 
     from app.bootstrap import build_app  
 
+    # Fix tooltip and popup position drift on Wayland/HiDPI fractional scaling.
+    # Must be set before QApplication is constructed.
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
     app = QApplication(sys.argv)
     QCoreApplication.setOrganizationName("zyroo")
     QCoreApplication.setApplicationName("abte")

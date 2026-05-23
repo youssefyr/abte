@@ -30,6 +30,31 @@ class FrameEnhancer:
         Returns (enhanced_frame, quality_meta).
         quality_meta: {"is_low_light": bool, "is_blurry": bool, "laplacian_var": float, "gamma": float}
         """
+        # Optimization for low end systems
+        is_low_end = False
+        try:
+            import psutil
+            is_low_end = (psutil.cpu_count(logical=True) or 4) <= 4
+        except Exception:
+            pass
+
+        if is_low_end:
+            gray = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2GRAY)
+            gray_small = cv2.resize(gray, (160, 120), interpolation=cv2.INTER_NEAREST)
+            
+            mean_brightness = float(np.mean(gray_small))
+            is_low_light = mean_brightness < self._target_brightness * 0.7
+            
+            lap_var = float(cv2.Laplacian(gray_small, cv2.CV_64F).var())
+            is_blurry = lap_var < (self._blur_check_threshold * 0.25)
+
+            return bgr_frame, {
+                "is_low_light": is_low_light,
+                "is_blurry": is_blurry,
+                "laplacian_var": lap_var,
+                "gamma": 1.0,
+            }
+
         ycrcb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2YCrCb)
         y, cr, cb = cv2.split(ycrcb)
 

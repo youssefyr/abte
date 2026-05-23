@@ -53,7 +53,8 @@ class FocusTickEngine(QObject):
 
         self._extractor = FocusFeatureExtractor(history_minutes=60)
         self._model = FocusLightGBMModel()
-        self._smoother = FocusSmoother(max_minutes=60, ema_alpha=0.15)
+        self._smoother = FocusSmoother(max_minutes=60, ema_alpha=None)  # alpha managed adaptively
+        self._session_start_time: datetime | None = None  # for adaptive EMA
 
         self._tick_timer = QTimer(self)
         self._tick_timer.setInterval(tick_interval_ms)
@@ -74,14 +75,19 @@ class FocusTickEngine(QObject):
         self._notification_service = None
         self._fact_service = None
         self._slm_service = None
+        self._slm_distraction_cache: dict[str, str] = {}  # title -> class cache
+        self._data_collection_dir: Path | None = None  # set via set_data_dir()
         
         self._last_nudge_time = datetime.min
         self._last_categorize_time = datetime.min
+        self._last_obs = None
+
 
         if model_path:
             self._model.load_model(Path(model_path))
         # Gaze is started by on_session_started() and stopped by on_session_ended().
-        # Do NOT call attach_session_service here — that creates a duplicate start/stop path.
+        # Do NOT call attach_session_service here — that creates a duplicate start/stop path,
+        # because FocusSessionService.set_gaze_service() already wires the gaze lifecycle.
 
 
     def set_notification_service(self, service: Any) -> None:
@@ -92,6 +98,11 @@ class FocusTickEngine(QObject):
         
     def set_slm_service(self, service: Any) -> None:
         self._slm_service = service
+
+    def set_data_dir(self, data_dir: Path) -> None:
+        """Enable training data collection. Written as NDJSON to data_dir/training/."""
+        self._data_collection_dir = data_dir / "training"
+        self._data_collection_dir.mkdir(parents=True, exist_ok=True)
 
     def start(self) -> None:
         if not self._tick_timer.isActive():
@@ -121,6 +132,9 @@ class FocusTickEngine(QObject):
     def on_session_started(self, session: SessionLogItem | Any) -> None:
         session_id = getattr(session, "id", None)
         self._smoother.start_session(session_id)
+        self._session_start_time = datetime.utcnow()
+        # Reset distraction class cache at session start
+        self._slm_distraction_cache = {}
 
         # Start gaze service when a session begins
         if self._gaze_service is not None:
@@ -160,10 +174,8 @@ class FocusTickEngine(QObject):
             meta["focus_score_source"] = "focus_tick_engine"
             meta["focus_score_updated_at"] = now.isoformat()
             session.meta = meta
-            if hasattr(self._repository, "add_session"):
-                self._repository.add_session(session)
         except Exception as exc:
-            logger.warning("Failed to persist session focus score: %s", exc)
+            logger.warning("Failed to update session focus score in memory: %s", exc)
 
     def _on_tick(self) -> None:
         now = datetime.utcnow()
@@ -172,6 +184,7 @@ class FocusTickEngine(QObject):
             return
 
         obs = self._capture_observation(now)
+        self._last_obs = obs
         self._extractor.record(obs)
 
         self._tick_counter += 1
@@ -192,6 +205,17 @@ class FocusTickEngine(QObject):
                 feature_count=len(features),
             )
             self.focus_updated.emit(self._last_snapshot)
+            self.snapshot_ready.emit(self._last_snapshot)  # also emit for plugin consumers
+
+            # Adaptive EMA: responsive for first 5 min, stable afterwards
+            if self._session_start_time is not None:
+                elapsed_min = (now - self._session_start_time).total_seconds() / 60.0
+                alpha = 0.4 if elapsed_min < 5.0 else max(0.10, 0.40 - (elapsed_min - 5.0) * 0.015)
+                self._smoother._ema_alpha = alpha
+
+            # Training data collection (#2)
+            session_id = self._current_session_id()
+            self._collect_observation_record(features, session_id)
             
             # --- Smart Notification Suppression ---
             if self._notification_service and hasattr(self._notification_service, "set_suppressed"):
@@ -224,12 +248,31 @@ class FocusTickEngine(QObject):
                 if now > self._last_categorize_time + timedelta(minutes=5):
                     plan = getattr(self._slm_service, "last_plan", None)
                     latency = getattr(plan, "estimated_latency_seconds", 0.0) if plan else 0.0
-                    # Only run in background idle if the system is fast (latency < 5.0s)
-                    # Otherwise, it should only be run immediately after task decomposition 
-                    # when the model is already loaded and "hot".
+                    # Only run background categorization when SLM latency is acceptable.
                     if latency < 5.0:
                         self._last_categorize_time = now
-                        # We would fetch uncategorized windows here and process them
+                        self._run_background_categorization()
+
+    def _run_background_categorization(self) -> None:
+        """Collect recent unique window titles and ask the SLM to classify them."""
+        try:
+            history = getattr(self._extractor, "_history", [])
+            titles: list[str] = []
+            seen: set[str] = set()
+            for obs in list(history)[-60:]:  # last 60 observations (~30s)
+                t = getattr(obs, "title", "") or ""
+                if t and t not in seen and t not in self._slm_distraction_cache:
+                    seen.add(t)
+                    titles.append(t)
+            if titles:
+                result = self._slm_service.categorize_distractions(titles)
+                if isinstance(result, dict):
+                    self._slm_distraction_cache.update(result)
+                    logger.debug(
+                        "FocusTickEngine: categorized %d window titles via SLM.", len(result)
+                    )
+        except Exception as exc:
+            logger.debug("FocusTickEngine: background categorization failed: %s", exc)
 
     def _capture_observation(self, now: datetime) -> FocusObservation:
         window_data = {}
@@ -260,11 +303,52 @@ class FocusTickEngine(QObject):
         gaze_present = False
         face_present = False
         absent_seconds_estimate = 0.0
+        yaw_deg = 0.0
+        pitch_deg = 0.0
+        blink_rate_per_min = 18.0
+        eye_open_avg = 0.8
+        gaze_zone = "ABSENT"
 
         if self._gaze_service is not None:
             gaze_present = bool(self._safe_call(self._gaze_service, "is_gaze_present", False))
             face_present = bool(self._safe_call(self._gaze_service, "is_face_present", gaze_present))
             absent_seconds_estimate = float(self._safe_call(self._gaze_service, "absent_seconds", 0.0) or 0.0)
+            
+            # Fetch latest GazeResult
+            gaze_res = self._safe_call(self._gaze_service, "get_last_result", None)
+            if gaze_res is not None:
+                yaw_deg = float(getattr(gaze_res, "yaw_deg", 0.0) or 0.0)
+                pitch_deg = float(getattr(gaze_res, "pitch_deg", 0.0) or 0.0)
+                blink_rate_per_min = float(getattr(gaze_res, "blink_rate_per_min", 18.0) or 18.0)
+                eye_open_avg = float(getattr(gaze_res, "eye_open_avg", 0.8) or 0.8)
+                if getattr(gaze_res, "zone", None) is not None:
+                    zone_val = gaze_res.zone
+                    gaze_zone = zone_val.name if hasattr(zone_val, "name") else str(zone_val).upper()
+
+        if not face_present:
+            gaze_zone = "ABSENT"
+
+        tab_fuzzy_match_score = 100.0
+        if self._tab_focus_guard is not None:
+            last_score = getattr(self._tab_focus_guard, "last_score", 1.0)
+            if last_score is not None:
+                tab_fuzzy_match_score = float(last_score * 100.0)
+
+        # Dynamic SLM/productivity classification — prefer cached SLM result, fall back to heuristics
+        current_title = str(window_data.get("title", "") or "")
+        slm_distraction_class = self._slm_distraction_cache.get(current_title, "")
+        if not slm_distraction_class:
+            if window_data.get("productive_keyword_hit", False):
+                slm_distraction_class = "PRODUCTIVE"
+            elif "coding" in str(window_data.get("process_tags", "")) or "terminal" in str(window_data.get("process_tags", "")):
+                slm_distraction_class = "PRODUCTIVE"
+            elif "browser" in str(window_data.get("process_tags", "")) and not window_data.get("productive_keyword_hit", False):
+                if self._tab_focus_guard is not None and getattr(self._tab_focus_guard, "_blocked", False):
+                    slm_distraction_class = "DISTRACTING"
+                else:
+                    slm_distraction_class = "NEUTRAL"
+            else:
+                slm_distraction_class = "UNKNOWN"
 
         return FocusObservation(
             timestamp=now,
@@ -280,6 +364,13 @@ class FocusTickEngine(QObject):
             absent_seconds_estimate=absent_seconds_estimate,
             focus_score_window_5m=float(window_data.get("focus_score_window_5m", 0.5) or 0.5),
             process_tags=str(window_data.get("process_tags", "") or ""),
+            yaw_deg=yaw_deg,
+            pitch_deg=pitch_deg,
+            blink_rate_per_min=blink_rate_per_min,
+            eye_open_avg=eye_open_avg,
+            gaze_zone=gaze_zone,
+            tab_fuzzy_match_score=tab_fuzzy_match_score,
+            slm_distraction_class=slm_distraction_class,
         )
 
     def _persist_closed_bucket(self, bucket) -> None:
@@ -317,6 +408,32 @@ class FocusTickEngine(QObject):
             return attr() if callable(attr) else attr
         except Exception:
             return default
+
+    def _collect_observation_record(
+        self, features: dict[str, Any], session_id: str | None
+    ) -> None:
+        """Write one NDJSON training record to disk when data collection is enabled (#2)."""
+        if self._data_collection_dir is None:
+            return
+        try:
+            import json as _json
+            from datetime import date as _date
+            from app.data.entities import FocusObservationRecord
+            record = FocusObservationRecord(
+                timestamp=datetime.utcnow().isoformat(),
+                session_id=session_id,
+                drift_label=1 if self._last_raw_risk >= 0.5 else 0,
+                raw_drift_risk=float(self._last_raw_risk),
+                focus_score=float(self._smoother.current_focus_score()),
+                features={k: v for k, v in features.items() if not isinstance(v, str) or len(v) < 64},
+            )
+            today = _date.today().isoformat()
+            out_file = self._data_collection_dir / f"observations_{today}.ndjson"
+            line = _json.dumps(record.__dict__) + "\n"
+            with open(out_file, "a", encoding="utf-8") as fh:
+                fh.write(line)
+        except Exception as exc:
+            logger.debug("FocusTickEngine: data collection write failed: %s", exc)
 
     # notify_session_started / notify_session_ended were removed.
     # FocusSessionService now calls on_session_started/ended directly.

@@ -17,10 +17,15 @@ class PlaceholderPage(BasePage):
         
     def filter_content(self, text: str):
         if not text:
-            self.lbl.setStyleSheet("")
+            self.lbl.setProperty("highlighted", False)
+            self.lbl.style().unpolish(self.lbl)
+            self.lbl.style().polish(self.lbl)
             return
             
         if text.lower() in self.lbl.text().lower():
-            self.lbl.setStyleSheet("background-color: yellow; color: black;")
+            self.lbl.setProperty("highlighted", True)
         else:
-            self.lbl.setStyleSheet("")
+            self.lbl.setProperty("highlighted", False)
+            
+        self.lbl.style().unpolish(self.lbl)
+        self.lbl.style().polish(self.lbl)

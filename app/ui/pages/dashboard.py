@@ -7,6 +7,7 @@ from shiboken6 import isValid
 from PySide6.QtCore import QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QFontMetrics, QPainter, QPaintEvent, QPen
 from PySide6.QtWidgets import (
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFrame,
@@ -98,6 +99,7 @@ class DashboardPage(BasePage):
         self._session_timer = QTimer(self)
         self._session_timer.setInterval(1000)
         self._session_timer.timeout.connect(self._update_session_clock)
+        self._target_minutes: int | None = None  # None = open-ended session
         self.main_layout.setContentsMargins(0, 0, 0, 0)
         self.main_layout.setSpacing(20)
 
@@ -205,6 +207,23 @@ class DashboardPage(BasePage):
         controls.setContentsMargins(0, 0, 0, 0)
         controls.setSpacing(8)
 
+        # Duration picker row (Pomodoro mode) — shown before the Start button
+        duration_row = QHBoxLayout()
+        duration_row.setContentsMargins(0, 0, 0, 0)
+        duration_row.setSpacing(8)
+        duration_label = make_label("Duration:", "muted")
+        self.duration_picker = QComboBox()
+        self.duration_picker.setObjectName("DurationPicker")
+        self.duration_picker.addItem("Open-ended", 0)
+        self.duration_picker.addItem("25 min (Pomodoro)", 25)
+        self.duration_picker.addItem("45 min", 45)
+        self.duration_picker.addItem("90 min", 90)
+        self.duration_picker.setToolTip("Set a target session duration. A notification fires and session auto-pauses when reached.")
+        duration_row.addWidget(duration_label)
+        duration_row.addWidget(self.duration_picker)
+        duration_row.addStretch(1)
+        controls.addLayout(duration_row)
+
         primary_row = QHBoxLayout()
         primary_row.setContentsMargins(0, 0, 0, 0)
         primary_row.setSpacing(8)
@@ -294,7 +313,7 @@ class DashboardPage(BasePage):
             self.focus_ring.setValue(task_progress if total_today else 58)
 
         self.hero_eyebrow.setText(datetime.now().strftime("%A, %b %d").upper())
-        self.hero_title.setText("Good evening, ready for a focused block?")
+        self.hero_title.setText(self._dynamic_greeting())
         self.hero_subtitle.setText(
             f"Your historically strongest cluster starts at {self._strongest_hour_text()}. "
             f"{remaining_today} active tasks still need attention today."
@@ -543,7 +562,42 @@ class DashboardPage(BasePage):
                 self.current_timer.setText("00:00")
             return
         elapsed = self.focus_session_service.elapsed_seconds(session)
-        self.current_timer.setText(self._elapsed_text_seconds(elapsed))
+        target = getattr(session, "target_minutes", None) or self._target_minutes
+        if target:
+            remaining_seconds = max(0, target * 60 - elapsed)
+            mm = remaining_seconds // 60
+            ss = remaining_seconds % 60
+            self.current_timer.setText(f"-{mm:02d}:{ss:02d}")
+            # Warn at 5 minutes remaining (fire once)
+            if remaining_seconds == 300:
+                try:
+                    from app.services.notification_service import NotificationService
+                    if hasattr(self, "_notif_5min_fired") and self._notif_5min_fired == session.id:
+                        pass
+                    else:
+                        self._notif_5min_fired = session.id  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            # Auto-pause when target reached
+            if remaining_seconds == 0:
+                session_id_key = getattr(session, "id", "")
+                already_fired = getattr(self, "_target_reached_session", None)
+                if already_fired != session_id_key:
+                    self._target_reached_session = session_id_key  # type: ignore[attr-defined]
+                    try:
+                        self.focus_session_service.pause_session()
+                    except Exception:
+                        pass
+        else:
+            self.current_timer.setText(self._elapsed_text_seconds(elapsed))
+
+    def _selected_target_minutes(self) -> int | None:
+        """Read the duration picker selection; returns None for open-ended."""
+        try:
+            value = self.duration_picker.currentData()
+            return int(value) if value else None
+        except Exception:
+            return None
 
     def _update_session_controls(self, session: Any | None) -> None:
         if self.focus_session_service is None:
@@ -584,11 +638,17 @@ class DashboardPage(BasePage):
     def _start_focus_session(self) -> None:
         if self.focus_session_service is None:
             return
+        self._target_minutes = self._selected_target_minutes()
         tasks = self.task_service.list_tasks()
         today_tasks = self.task_service.tasks_for_day(date.today())
         next_task = self._pick_current_task(today_tasks, tasks, None)
         task_id = getattr(next_task, "id", None) if next_task is not None else None
-        self.focus_session_service.start_session(planned_task_id=task_id, source="next_task")
+        session = self.focus_session_service.start_session(planned_task_id=task_id, source="next_task")
+        if session is not None and self._target_minutes:
+            try:
+                session.target_minutes = self._target_minutes  # type: ignore[attr-defined]
+            except Exception:
+                pass
         self.refresh_data()
 
     def _start_focus_session_with_picker(self) -> None:
@@ -691,13 +751,17 @@ class DashboardPage(BasePage):
         self.labels_to_search = [lbl for lbl in self.labels_to_search if isValid(lbl)]
         if not text:
             for lbl in self.labels_to_search:
-                lbl.setStyleSheet("")
+                lbl.setProperty("highlighted", False)
+                lbl.style().unpolish(lbl)
+                lbl.style().polish(lbl)
             return
         for lbl in self.labels_to_search:
             if text in lbl.text().lower():
-                lbl.setStyleSheet("color: #0E1512; background: rgba(62,207,142,0.85); border-radius: 6px;")
+                lbl.setProperty("highlighted", True)
             else:
-                lbl.setStyleSheet("")
+                lbl.setProperty("highlighted", False)
+            lbl.style().unpolish(lbl)
+            lbl.style().polish(lbl)
     def set_live_focus_snapshot(self, snapshot: LiveFocusSnapshot | None) -> None:
         self._live_focus_snapshot = snapshot
         if snapshot is None:
@@ -746,17 +810,71 @@ class DashboardPage(BasePage):
         drift = snapshot.raw_drift_risk
         if drift < 0.35:
             delta_text = "Focused"
-            tone_style = "color: #3ECF8E;"
+            pill_type = "PillGood"
         elif drift < 0.65:
             delta_text = "Drifting"
-            tone_style = "color: #F59E0B;"
+            pill_type = "Pill"
         else:
             delta_text = "Distracted"
-            tone_style = "color: #EF4444;"
+            pill_type = "PillDanger"
 
         self.kpi_focus_delta.setText(delta_text)
-        self.kpi_focus_delta.setStyleSheet(tone_style)
+        self.kpi_focus_delta.setObjectName(pill_type)
+        self.kpi_focus_delta.style().unpolish(self.kpi_focus_delta)
+        self.kpi_focus_delta.style().polish(self.kpi_focus_delta)
+
+        # Feature attribution tooltip on the ring
+        explanation = self._explain_focus_score(snapshot)
+        if explanation:
+            self.focus_ring.setToolTip(explanation)
+            self.kpi_focus_value.setToolTip(explanation)
 
         # Model load status badge (optional, only logs when it changes)
         if not snapshot.model_loaded:
             self.kpi_focus_delta.setText("No model")
+
+
+    def _dynamic_greeting(self) -> str:
+        """Returns a time-of-day contextual greeting, personalised when profile name is available."""
+        hour = datetime.now().hour
+        name: str = ""
+        try:
+            if hasattr(self.repository, "get_profile"):
+                profile = self.repository.get_profile()
+                n = getattr(profile, "display_name", "") or ""
+                if n and n.lower() not in {"abte user", "user", ""}:
+                    name = f", {n.split()[0]}"
+        except Exception:
+            pass
+
+        if 5 <= hour < 12:
+            return f"Good morning{name} \u2014 ready to make progress?"
+        elif 12 <= hour < 17:
+            return f"Good afternoon{name} \u2014 time to get things done."
+        elif 17 <= hour < 21:
+            return f"Good evening{name} \u2014 ready for a focused block?"
+        else:
+            return f"Working late{name}? Let's keep it light and focused."
+
+    def _explain_focus_score(self, snapshot: object) -> str:
+        """Build a 'Why is my score X?' tooltip string from feature attributions."""
+        try:
+            if self.focus_tick_engine is None:
+                return ""
+            model = getattr(self.focus_tick_engine, "_model", None)
+            if model is None or not hasattr(model, "explain_prediction"):
+                return ""
+            extractor = getattr(self.focus_tick_engine, "_extractor", None)
+            last_obs = getattr(self.focus_tick_engine, "_last_obs", None)
+            if extractor is None or last_obs is None:
+                return ""
+            features = extractor.build_features(last_obs)
+            contributions = model.explain_prediction(features, top_n=3)
+            if not contributions:
+                return ""
+            lines = ["\u2139 Why this score?"]
+            for label, pct in contributions:
+                lines.append(f"  \u2022 {label} ({pct:.0f}%)")
+            return "\n".join(lines)
+        except Exception:
+            return ""

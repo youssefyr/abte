@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, cast
 
-from PySide6.QtCore import QEasingCurve, QPropertyAnimation, Qt
+from PySide6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QTimer
 from PySide6.QtGui import QKeySequence, QResizeEvent, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -86,10 +86,24 @@ class MainWindow(QMainWindow):
         self.fact_store = FactStore(settings.app_data_dir() / "facts")
         self.fact_service = FactService(self.fact_store)
 
+        from app.services.sidebar_template_service import SidebarTemplateService
+        self._sidebar_template_service = SidebarTemplateService(
+            repository=self.repository,
+            settings=self.settings,
+            plugin_manager=self._plugin_manager,
+            gaze_service=self.gaze_service,
+        )
+
         if self.focus_tick_engine is not None:
             self.focus_tick_engine.set_notification_service(self.notification_service)
             self.focus_tick_engine.set_slm_service(self._slmService)
             self.focus_tick_engine.set_fact_service(self.fact_service)
+            # Enable training data collection if a data dir is available
+            try:
+                if hasattr(self.settings, "app_data_dir"):
+                    self.focus_tick_engine.set_data_dir(self.settings.app_data_dir())
+            except Exception:
+                pass
 
         saved_theme = self.settings.get("Settings/theme")
 
@@ -147,7 +161,7 @@ class MainWindow(QMainWindow):
 
         last_page_val = self.settings.get("MainWindow/last_page", "dashboard")
         self._navigate_request(last_page_val)
-        self._maybe_open_startup_setup()
+        QTimer.singleShot(100, self._maybe_open_startup_setup)
 
     def closeEvent(self, event) -> None:
         self.settings.set("MainWindow/geometry", self.saveGeometry())
@@ -188,25 +202,10 @@ class MainWindow(QMainWindow):
         toast.setMinimumWidth(300)
         toast.setMaximumWidth(400)
         
-        bg_color = self._theme_manager.THEMES[self._current_theme].card_bg
-        text_color = self._theme_manager.THEMES[self._current_theme].text_main
-        border_color = self._theme_manager.THEMES[self._current_theme].primary
-        
-        if item.level == "error":
-            border_color = self._theme_manager.THEMES[self._current_theme].danger
-        elif item.level == "warning":
-            border_color = self._theme_manager.THEMES[self._current_theme].warning
-            
-        toast.setStyleSheet(f"""
-            QLabel {{
-                background-color: {bg_color};
-                color: {text_color};
-                border: 2px solid {border_color};
-                border-radius: 8px;
-                padding: 12px;
-                font-size: 14px;
-            }}
-        """)
+        toast.setObjectName("ToastMessage")
+        toast.setProperty("level", item.level)
+        toast.style().unpolish(toast)
+        toast.style().polish(toast)
         
         toast.adjustSize()
         
@@ -252,6 +251,7 @@ class MainWindow(QMainWindow):
         self.planner_page = PlannerPage(self._metrics, self.repository)
         self.tasks_page = TaskEditorPage(self._metrics, self.task_service, self.notification_service, self._slmService)
         self.coach_page = CoachPage(self._metrics, self.task_service)
+        self.coach_page.set_slm_service(self._slmService)
         self.notifications_page = NotificationsPage(self._metrics, self.notification_service)
         self.plugins_page = PluginsManagerWidget(self._plugin_manager)
         self.settings_page = SettingsPage(
@@ -260,6 +260,7 @@ class MainWindow(QMainWindow):
             repository=self.repository,
             active_window_service=self.active_window_service,
             gaze_service=self.gaze_service,
+            sidebar_template_service=self._sidebar_template_service,
         )
         self.account_page = AccountPage(
             self._metrics,
@@ -385,15 +386,6 @@ class MainWindow(QMainWindow):
 
         self._notif_badge.setFixedSize(badge_w, badge_h)
 
-        self._notif_badge.setStyleSheet(f"""
-            QLabel#TopbarBadge {{
-                background: {self._theme_manager.THEMES[self._current_theme].danger};
-                color: white;
-                font-weight: 700;
-                border-radius: {badge_h // 2}px;
-            }}
-        """)
-
         self._position_notification_badge()
 
         self._notif_badge.show()
@@ -486,8 +478,18 @@ class MainWindow(QMainWindow):
         icon_manager.apply(self.avatar_btn, "mdi6.account-circle-outline", size=avatar_icon)
         self.avatar_btn.clicked.connect(lambda: self._navigate_to_key("account"))
 
+        self._gaze_dot = QLabel("●", frame)
+        self._gaze_dot.setObjectName("GazeDot")
+        self._gaze_dot.setProperty("state", "off")
+        self._gaze_dot.setToolTip("Gaze tracking: off")
+        self._gaze_dot.setFixedSize(16, 16)
+        self._gaze_dot.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._gaze_dot.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._gaze_dot.mousePressEvent = lambda _: self._navigate_to_key("settings")
+
         layout.addWidget(left_host, 1)
         layout.addWidget(self.search, 1)
+        layout.addWidget(self._gaze_dot, 0)
         layout.addWidget(self._notify_container, 0)
         layout.addWidget(self.theme_toggle_btn, 0)
         layout.addWidget(self.quick_add_btn, 0)
@@ -511,6 +513,21 @@ class MainWindow(QMainWindow):
             self.repository.notifications_changed.connect(self._refresh_nav_badges)
         if hasattr(self.repository, "profile_changed"):
             self.repository.profile_changed.connect(self._apply_profile_avatar)
+            self.repository.profile_changed.connect(self.dashboard_page.refresh_data)
+            self.repository.profile_changed.connect(self.settings_page.load_from_settings)
+
+        # Wire gaze calibration decay + camera status to topbar dot (#8 + #19)
+        if self.gaze_service is not None:
+            if hasattr(self.gaze_service, "calibration_decay_detected"):
+                self.gaze_service.calibration_decay_detected.connect(
+                    self._on_calibration_decay
+                )
+            if hasattr(self.gaze_service, "camera_status"):
+                self.gaze_service.camera_status.connect(
+                    self._on_camera_status_changed
+                )
+            if hasattr(self.gaze_service, "gaze_updated"):
+                self.gaze_service.gaze_updated.connect(self._on_gaze_updated_topbar)
 
     def _on_sidebar_collapsed(self, collapsed: bool) -> None:
         if collapsed:
@@ -576,7 +593,9 @@ class MainWindow(QMainWindow):
             name = str(self.settings.get("Profile/display_name", "abte user") or "abte user")
             avatar_path = str(self.settings.get("Profile/avatar_path", "") or "")
         
-        self.sidebar.set_profile_avatar(name, avatar_path)
+        template = str(self.settings.get("Profile/custom_sidebar_text", "PLANNER · DOER") or "PLANNER · DOER")
+        resolved_text = self._sidebar_template_service.render(template, name)
+        self.sidebar.set_profile_avatar(name, avatar_path, resolved_text)
         if hasattr(self.account_page, "refresh_data"):
             self.account_page.refresh_data()
 
@@ -633,6 +652,7 @@ class MainWindow(QMainWindow):
         camera_index = int(settings.get("Vision/camera_index", 0) or 0)
         self.gaze_service.set_enabled(enabled)           # gates session-start
         self.gaze_service.configure(model_path, camera_index)
+        self._apply_profile_avatar()
         self.settings_page.mark_as_applied()
 
     def _on_settings_applied(self, settings: dict) -> None:
@@ -804,6 +824,7 @@ class MainWindow(QMainWindow):
             self._notif_badge.show()
         else:
             self._notif_badge.hide()
+        self._apply_profile_avatar()
 
     def _open_quick_add(self) -> None:
         self.show_detail_overlay()
@@ -955,3 +976,57 @@ class MainWindow(QMainWindow):
                 self.dashboard_page.on_live_focus_updated(snapshot)
             except Exception:
                 pass
+
+    def _set_gaze_dot_state(self, state: str) -> None:
+        if hasattr(self, "_gaze_dot"):
+            self._gaze_dot.setProperty("state", state)
+            self._gaze_dot.style().unpolish(self._gaze_dot)
+            self._gaze_dot.style().polish(self._gaze_dot)
+
+    def _on_calibration_decay(self) -> None:
+        """Gaze calibration accuracy has degraded — notify user and turn dot yellow (#8)."""
+        self._set_gaze_dot_state("degraded")
+        if hasattr(self, "_gaze_dot"):
+            self._gaze_dot.setToolTip("Gaze: calibration degraded — click to recalibrate")
+        try:
+            self.notification_service.publish(
+                title="Gaze calibration degraded",
+                message="Head pose accuracy has dropped. Click the yellow dot in the topbar to recalibrate.",
+                level="warning",
+            )
+        except Exception:
+            pass
+
+    def _on_camera_status_changed(self, status: str, detail: str) -> None:
+        """Updates the gaze status dot colour based on camera state (#8 + #19)."""
+        if not hasattr(self, "_gaze_dot"):
+            return
+        if status in {"unavailable", "lost"}:
+            self._set_gaze_dot_state("error")
+            self._gaze_dot.setToolTip(f"Gaze: camera {status} ({detail}) — click to open settings")
+        elif status == "degraded":
+            self._set_gaze_dot_state("degraded")
+            self._gaze_dot.setToolTip("Gaze: poor lighting or low quality frame — click to open settings")
+        elif status == "ok":
+            self._set_gaze_dot_state("active")
+            self._gaze_dot.setToolTip("Gaze tracking: active")
+        else:
+            self._set_gaze_dot_state("off")
+            self._gaze_dot.setToolTip(f"Gaze: {status}")
+
+    def _on_gaze_updated_topbar(self, result: object) -> None:
+        """Keeps the gaze dot green while the camera is live and face is present (#19)."""
+        if not hasattr(self, "_gaze_dot"):
+            return
+        face_present = bool(getattr(result, "face_detected", False))
+        zone = getattr(result, "zone", None)
+        zone_name = zone.name if hasattr(zone, "name") else str(zone).upper() if zone else ""
+        if zone_name == "DEGRADED":
+            self._set_gaze_dot_state("degraded")
+            self._gaze_dot.setToolTip("Gaze: signal degraded (poor light or blur) — click to open settings")
+        elif face_present:
+            self._set_gaze_dot_state("active")
+            self._gaze_dot.setToolTip("Gaze tracking: active — face detected")
+        else:
+            self._set_gaze_dot_state("off")
+            self._gaze_dot.setToolTip("Gaze: no face detected")

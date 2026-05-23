@@ -83,75 +83,49 @@ def _width_class(width: int) -> WidthClass:
     return WidthClass.LARGE
 
 
+def fluid_scale(val_min: float, val_max: float, width: int, min_w: int = 1000, max_w: int = 1920) -> float:
+    """
+    Interpolates smoothly between val_min and val_max using a smoothstep (S-curve)
+    function, as the window width scales from min_w to max_w.
+    """
+    t = (width - min_w) / (max_w - min_w)
+    t = max(0.0, min(1.0, t))
+    # Smooth step (S-curve) for organic transition
+    t_smooth = t * t * (3.0 - 2.0 * t)
+    return val_min + t_smooth * (val_max - val_min)
+
+
 def build_metrics(window_width: int, widget: QWidget | None = None) -> UiMetrics:
     screen = _screen_for(widget)
     scale = _dpi_scale(screen)
     wc = _width_class(window_width)
 
+    # 1. Continuous Fluid layout values (pixels, pre-scaled)
+    # If in compact state, non-collapsed sidebar width starts smaller (e.g. 200px)
+    base_sidebar = fluid_scale(200, 264, window_width)
+    base_panel = fluid_scale(290, 360, window_width)
+    
+    page_margin = fluid_scale(10, 16, window_width)
+    card_padding = fluid_scale(12, 18, window_width)
+    gap = fluid_scale(10, 14, window_width)
+    
+    toolbar_height = fluid_scale(54, 64, window_width)
+    nav_row = fluid_scale(38, 46, window_width)
+    control = fluid_scale(36, 44, window_width)
+    compact_control = fluid_scale(32, 38, window_width)
+    
+    radius = fluid_scale(8, 12, window_width)
+    border_width = fluid_scale(1, 1.2, window_width)
+
+    # Override for COMPACT sidebar to guarantee compatibility with layout
     if wc == WidthClass.COMPACT:
         base_sidebar = 116
-        base_panel = 300
-        page_margin = 10
-        card_padding = 12
-        gap = 10
-        toolbar_height = 56
-        nav_row = 40
-        control = 38
-        compact_control = 34
-        radius = 10
-        border_width = 1
-        title_pt = 16
-        section_pt = 12
-        body_pt = 10
-        meta_pt = 9
-    elif wc == WidthClass.MEDIUM:
-        base_sidebar = 232
-        base_panel = 320
-        page_margin = 12
-        card_padding = 14
-        gap = 12
-        toolbar_height = 60
-        nav_row = 42
-        control = 40
-        compact_control = 36
-        radius = 10
-        border_width = 1
-        title_pt = 17
-        section_pt = 13
-        body_pt = 10
-        meta_pt = 9
-    elif wc == WidthClass.EXPANDED:
-        base_sidebar = 248
-        base_panel = 340
-        page_margin = 14
-        card_padding = 16
-        gap = 12
-        toolbar_height = 62
-        nav_row = 44
-        control = 42
-        compact_control = 36
-        radius = 11
-        border_width = 1
-        title_pt = 18
-        section_pt = 13
-        body_pt = 10
-        meta_pt = 9
-    else:
-        base_sidebar = 264
-        base_panel = 360
-        page_margin = 16
-        card_padding = 18
-        gap = 14
-        toolbar_height = 64
-        nav_row = 46
-        control = 44
-        compact_control = 38
-        radius = 12
-        border_width = 1
-        title_pt = 19
-        section_pt = 13
-        body_pt = 10
-        meta_pt = 9
+
+    # 2. Continuous Fluid typography values (pt, DPI scaled natively by Qt)
+    title_pt = round(fluid_scale(15, 19, window_width))
+    section_pt = round(fluid_scale(11.5, 13, window_width))
+    body_pt = round(fluid_scale(9.5, 10.5, window_width))
+    meta_pt = round(fluid_scale(8, 9, window_width))
 
     return UiMetrics(
         scale=scale,

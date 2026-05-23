@@ -115,16 +115,6 @@ class SidebarMenu(QFrame):
         self.brand_mark.setObjectName("SidebarBrandMark")
         self.brand_mark.setFixedSize(48, 48)
         self.brand_mark.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.brand_mark.setStyleSheet("""
-            QToolButton#SidebarBrandMark {
-                border: none;
-                background: transparent;
-                border-radius: 24px;
-            }
-            QToolButton#SidebarBrandMark:hover {
-                background: rgba(255, 255, 255, 0.08);
-            }
-        """)
         brand_icon = icon_manager.icon("mdi6.leaf", size=32)
         if not brand_icon.isNull():
             self.brand_mark.setIcon(brand_icon)
@@ -137,8 +127,8 @@ class SidebarMenu(QFrame):
         self.brand_col.setContentsMargins(0, 0, 0, 0)
         self.brand_col.setSpacing(2)
         self.app_title = QLabel("abte")
+        self.app_title.setObjectName("SidebarAppTitle")
         self.app_title.setProperty("role", "sectionTitle")
-        self.app_title.setStyleSheet("font-size: 16px; font-weight: 600;")
         self.app_subtitle = make_label("PLANNER · DOER", "meta")
         self.brand_col.addWidget(self.app_title)
         self.brand_col.addWidget(self.app_subtitle)
@@ -161,7 +151,6 @@ class SidebarMenu(QFrame):
         self.nav_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.nav_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.nav_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.nav_scroll.setStyleSheet("QScrollArea { background: transparent; } QWidget#NavHost { background: transparent; }")
 
         self.nav_host = QWidget()
         self.nav_host.setObjectName("NavHost")
@@ -190,7 +179,7 @@ class SidebarMenu(QFrame):
         self._profile_name = ""
         self._profile_avatar_path = ""
 
-    def set_profile_avatar(self, name: str, avatar_path: str) -> None:
+    def set_profile_avatar(self, name: str, avatar_path: str, custom_text: str = "") -> None:
         self._profile_name = name
         self._profile_avatar_path = avatar_path
         size = 48
@@ -199,6 +188,8 @@ class SidebarMenu(QFrame):
             pixmap = build_initials_avatar(name or "A", size, shape="circle")
         self.brand_mark.setIcon(QIcon(pixmap))
         self.brand_mark.setIconSize(QSize(size, size))
+        self.app_title.setText(name or "abte user")
+        self.app_subtitle.setText(custom_text or "PLANNER · DOER")
 
     def paintEvent(self, event: QPaintEvent) -> None:
         super().paintEvent(event)
