@@ -31,6 +31,7 @@ The app also ships with browser extensions (Firefox + Chrome) that communicate w
     - [NotificationService](#notificationservice)
     - [ActiveWindowService + WindowTracker](#activewindowservice--windowtracker)
     - [FactService](#factservice)
+    - [SidebarTemplateService (Custom Dynamic Sidebar Text)](#sidebartemplateservice)
 4. [AI / ML / CV / NLP Features](#ai--ml--cv--nlp-features)
 5. [Data Layer](#data-layer)
 6. [UI Architecture](#ui-architecture)
@@ -117,6 +118,7 @@ abte/
 │   ├── services/
 │   │   ├── focus_tick_engine.py      # The brain: 500ms tick, feature aggregation, ML inference
 │   │   ├── focus_session_service.py  # Session lifecycle (start/pause/resume/stop)
+│   │   ├── focus_smoother.py         # Modernized focus drift bucket accumulator & EWMA smoother
 │   │   ├── gaze_service.py          # High-level gaze management (start/stop/calibrate)
 │   │   ├── active_window_service.py  # Wraps WindowTracker for the rest of the app
 │   │   ├── handle_tasks.py          # TaskService: CRUD, quick-add parsing, NL task creation
@@ -126,9 +128,12 @@ abte/
 │   │   ├── extension_core.py        # Native messaging bridge to browser extensions
 │   │   ├── tab_focus_guard.py       # NLP fuzzy matching for tab blocking
 │   │   ├── planner_service.py       # Energy-aware scheduling (KMeans + OR-Tools)
+│   │   ├── sidebar_template_service.py # Custom sidebar template renderer
 │   │   └── slm/
 │   │       ├── slm_service.py       # Local LLM orchestration (llama.cpp / ONNX)
 │   │       ├── hardware_planner.py  # CPU/GPU sampling, execution plan selection
+│   │       ├── model_catalog.py     # GGUF model registry and automated down-discovery
+│   │       ├── slm_async.py         # QThread workers & SlmWorkerPool for background LLM calls
 │   │       ├── benchmark_store.py   # Benchmark history for inference decisions
 │   │       ├── models.py            # Dataclasses for SLM config, plans, stats
 │   │       └── parser_utils.py      # JSON extraction from LLM output
@@ -140,7 +145,8 @@ abte/
 │   │   ├── navigation.py            # SidebarMenu widget
 │   │   ├── nav_config.py            # Page ordering and header metadata
 │   │   ├── calendar_widget.py       # Week view calendar
-│   │   ├── startup_wizard_dialog.py # First-run setup wizard
+│   │   ├── startup_wizard_dialog.py # First-run setup wizard (integrates model selector)
+│   │   ├── slm_model_selector.py    # UI widget for selecting & downloading GGUF models
 │   │   ├── icon_manager.py          # qtawesome icon wrapper
 │   │   ├── ui_helpers.py            # Factory functions (make_card, make_button, etc.)
 │   │   ├── plugins_manager.py       # Plugin list UI
@@ -158,6 +164,8 @@ abte/
 │   │       └── gaze_calibration_wizard.py
 │   │
 │   └── tests/                       # pytest suite
+│       ├── test_abte.py             # Main integration & service tests
+│       └── test_sidebar_template.py # Sidebar template engine unit tests
 │
 └── extension/
     ├── firefox/
@@ -209,6 +217,18 @@ Key signals:
 - `session_paused(str)`
 - `session_resumed(str)`
 - `session_stopped(str, dict)` — session ID + final metrics
+
+### FocusSmoother
+
+**File:** `app/services/focus_smoother.py`
+
+Handles the accumulation, smoothing, and aggregation of raw attention-drift predictions over time. Rather than relying on instantaneous noisy outputs from the LightGBM classifier, `FocusSmoother` groups ticks into minute-by-minute buckets to maintain clean history and smooths recent ticks using Exponentially Weighted Moving Averages (EWMA).
+
+Key components:
+- **`MinuteBucket`**: Dataclass representing a closed 1-minute interval of ticks. Stores the average `p_drift`, tick count, linked `session_id`, and metadata.
+- **`LiveFocusSnapshot`**: The data payload emitted on every tick containing raw scores, EWMA smoothed scores (scaled 0-100), active window titles, process names, gaze presence, and tick index.
+- **Active Session Tracking**: Integrates with the current session via `start_session(session_id)` and `end_session()`. Calculates clean session averages by weighting closed bucket averages.
+- **Exponential Smoothing (`_update_ema`)**: Applies EWMA (configurable alpha, defaults to `0.15`) over the sliding window history. Automatically falls back to raw averages if EWMA is disabled or uninitialized.
 
 ### GazeService + Vision Pipeline
 
@@ -277,7 +297,40 @@ Orchestrates a local small language model for several AI features. Supports two 
 | `llama_cpp` | llama.cpp CLI (`llama-cli`, `main`, or `llama` binary) | Preferred. Supports CPU, GPU, and hybrid execution. |
 | `onnx_runtime` | ONNX Runtime | Fallback. CPU or GPU via execution providers. |
 
-**Hardware planning:** Before each inference call, `hardware_planner.py` samples current CPU/GPU utilization and memory, checks benchmark history, and picks the best execution target (cpu/gpu/hybrid). It decides how many GPU layers to offload for llama.cpp. All of this is to avoid OOM kills and to pick the fastest path based on the user's actual hardware.
+#### 1. GGUF Model Catalog & Auto-Discovery
+**File:** `app/services/slm/model_catalog.py`
+
+ABTE features a modular model catalog supporting different hardware tiers:
+- **`LFM-2.5 1.2B Thinking` (Lightweight)**: ~850 MB download size, requires ≥1.1 GB RAM. Highly recommended for low-resource or older CPU systems.
+- **`Phi-3 Mini 4K` (Standard)**: ~2.2 GB download size, requires ≥2.8 GB RAM. Strong reasoning capabilities, optimized for modern CPUs or GPUs.
+
+**Automated Discovery Caching**: The model catalog implements a robust path scanner (`find_downloaded_model`) that searches for existing downloaded models across multiple directories to avoid redundant downloads. It checks:
+1. Application model folder (`~/.gemini/antigravity/models` or similar `app_data_dir/models`).
+2. Global system cache locations: Hugging Face hubs (`~/.cache/huggingface/hub`), LM Studio cache (`~/.cache/lm-studio/models` or `~/.lmstudio/models`), standard `Downloads` folder, local share directories, and OS AppData structures.
+3. Hermetic unit tests automatically bypass global system checks to ensure clean, isolated testing boundaries.
+
+#### 2. Hardware Planner & Resource Budgets
+**File:** `app/services/slm/hardware_planner.py`
+
+Before each inference call, the planner samples active system resources:
+- **Strict Resource Budgeting**: A 25-50% CPU utilization budget is checked and respected to ensure the host desktop application remains responsive and benchmark timeouts are avoided.
+- **Dynamic Thread Tuning & Layer Offloading**: Based on real-time CPU/GPU memory headroom and historical benchmarks stored in `BenchmarkStore`, the planner selects the target execution plan (CPU, GPU, or Hybrid) and dynamically offloads an optimal number of layers (reducing GPU offload under VRAM pressure to prevent OOM errors).
+
+#### 3. Asynchronous Execution Pipeline
+**File:** `app/services/slm/slm_async.py`
+
+To prevent slow subprocess/CLI-based LLM execution (which takes 5-30+ seconds) from freezing the PySide6 Qt GUI main thread, all inference operations are wrapped in background workers:
+- **`DecomposeTaskWorker`**: Asynchronously breaks goals into structured subtask lists.
+- **`GenerateWeeklyReviewWorker`**: Asynchronously compiles weekly reports from database logs.
+- **`CategorizeDistractionsWorker`**: Asynchronously classifies active OS window titles.
+- **`SlmWorkerPool`**: Central pool coordinator that enforces single-concurrency execution of background workers. In-flight requests are automatically cancelled (`cancel()`) when a new request arrives, discarding stale results and saving CPU cycles.
+
+#### 4. Model Selection & Integration UI
+**File:** `app/ui/slm_model_selector.py` & `app/ui/startup_wizard_dialog.py`
+
+The modern **`SlmModelSelector`** UI widget provides an interactive interface displaying available models, their resource footprints, compatibility scores (computed dynamically based on system specifications), download progress, and local path status. This is integrated into:
+- The **Settings Page** under the SLM Configuration panel.
+- The **Startup Setup Wizard**, enabling users to choose a suitable model tier, download it, or auto-detect an existing local cache before using NLP and AI features.
 
 **AI features powered by the SLM:**
 
@@ -380,6 +433,28 @@ Cross-platform active window detection. Returns the window title, process name, 
 Simple service that pulls random motivational nudges and facts from a local store (`FactStore`). Used by `FocusTickEngine` when the user's drift is high.
 
 Categories: `nudge` (short refocus prompts) and `motivation` (encouraging messages). Always has a fallback default so it never returns empty.
+
+### SidebarTemplateService
+
+**File:** `app/services/sidebar_template_service.py`
+
+Enables users to customize the desktop application's sidebar text dynamically by resolving active data-driven tokens at runtime. It decouples UI presentation from backend service implementation.
+
+The template service compiles and substitutes 12 dynamic placeholders:
+1. `{{plugin_number}}`: Counts active third-party plugins (excluding `core.demo`).
+2. `{{username}}`: Preferred user display name (fallback: `abte user`).
+3. `{{task_count}}`: Total count of tasks currently stored in the repository.
+4. `{{todo_count}}`: Pending tasks (`todo` or `in_progress`).
+5. `{{done_count}}`: Completed tasks.
+6. `{{focus_session_count}}`: Completed focus sessions.
+7. `{{total_focus_minutes}}`: Aggregated productive minutes across all sessions.
+8. `{{current_date}}`: Today's system date (`YYYY-MM-DD`).
+9. `{{current_time}}`: Current system time (`HH:MM`).
+10. `{{unread_notifications}}`: Counts unread internal notifications.
+11. `{{gaze_status}}`: Live eye-gaze tracking status (`active`/`inactive`).
+12. `{{theme_name}}`: Name of the active visual stylesheet theme.
+
+It provides a `get_placeholders_metadata()` method to list descriptions of all supported variables, making it self-documenting for settings pages.
 
 ---
 

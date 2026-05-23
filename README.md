@@ -6,13 +6,16 @@ ABTE is a cross-platform desktop productivity tool built with PySide6, integrati
 
 ## Features
 
-- **Modern Desktop UI**: Built with PySide6 and Qt, featuring custom widgets, themes, and animations.
-- **AI & ML Integration**: Includes models for state prediction, scheduling, focus tracking, and more.
-- **Computer Vision**: Face landmark detection, feature extraction, and calibration modules.
-- **NLP & Task Automation**: Smart scheduling, task management, and natural language processing.
-- **Plugin System**: Easily extend core functionality with custom plugins and integrations.
-- **Robust Testing**: Comprehensive test suite using pytest.
-- **Cross-Platform**: Runs on Linux, Windows, and macOS.
+- **Modern Desktop UI**: Built with PySide6 and Qt, featuring custom widgets, dynamic runtime themes, and micro-animations.
+- **AI & ML Integration**: High-frequency focus drift tracking using custom-trained LightGBM, constraint-based task scheduling (Google OR-Tools), and energy pattern clustering (KMeans).
+- **Local Small Language Model (SLM)**: Modular GGUF catalog (`LFM-2.5 1.2B Thinking` and `Phi-3 Mini 4K`) with automated download discovery and execution target optimization (CPU/GPU/Hybrid with hardware planner).
+- **Asynchronous AI Workers**: Non-blocking asynchronous QThread-based pipeline execution to prevent PySide6 main thread freeze.
+- **Customizable Sidebar Template Engine**: Render dynamic statistics and app states directly in the sidebar using 12 customizable template variables (e.g. active tasks, focus minutes, unread notifications).
+- **Computer Vision**: High-performance eye-gaze tracking and facial landmarker pipeline with real-time blur and low-light enhancement.
+- **NLP & Task Automation**: Smart NLP-based browser tab relevance checking using fuzzy string comparison (`rapidfuzz`) and inline task shorthand quick-add.
+- **Plugin System**: Modular plugins register independent SQLite migrations, schema versioning, and customized data payloads.
+- **Robust Testing & Clean Infrastructure**: Thoroughly cleaned test suite leveraging mock systems to verify scheduling, SLM backends, templates, and UI components.
+- **Cross-Platform**: Runs natively on Linux, Windows, and macOS.
 
 ---
 
@@ -20,14 +23,13 @@ ABTE is a cross-platform desktop productivity tool built with PySide6, integrati
 
 ```
 app/
-  ai/           # AI, ML, and NLP models and services
   calibration/  # Vision calibration and data storage
   core/         # Core engines, settings, logging, plugin API
-  data/         # Data entities and repositories
-  models/       # ML models and runtime logic
-  services/     # Application and system services
-  tests/        # Test suite (pytest)
-  ui/           # UI components, widgets, and helpers
+  data/         # Data entities and SQLite repositories
+  models/       # ML models, serializers, and runtimes (LightGBM, etc.)
+  services/     # Application and system services (including services/slm/)
+  tests/        # Comprehensive test suite (pytest)
+  ui/           # UI pages, components, widgets, and helpers
 main.py         # Application entry point
 find_unused_py_files.py, count_py_lines.py, test_fix.py  # Dev utilities
 ```
@@ -85,17 +87,8 @@ pip install pyinstaller
 pyinstaller --noconfirm --clean \
   --name abte \
   --windowed \
-  --add-data "app/ui:app/ui" \
-  --add-data "app/models:app/models" \
-  --add-data "app/data:app/data" \
-  --add-data "app/calibration:app/calibration" \
-  --add-data "app/ai:app/ai" \
-  --add-data "app/services:app/services" \
-  --add-data "app/core:app/core" \
-  --add-data "app/tests:app/tests" \
-  --add-data "app/plugins:app/plugins" \
-  --add-data "app/vision:app/vision" \
   --add-data "app:app" \
+  --add-data "extension:extension" \
   --hidden-import=PySide6.QtCore \
   --hidden-import=PySide6.QtGui \
   --hidden-import=PySide6.QtWidgets \
@@ -117,7 +110,7 @@ pyinstaller --noconfirm --clean \
 ## Extensibility
 
 - **Plugin API**: Add new features by dropping Python modules into the `app/plugins/` directory.
-- **Custom Models**: Integrate new ML/CV/NLP models by extending the `app/ai/` and `app/models/` modules.
+- **Custom Models**: Integrate new ML/CV/NLP models by extending the `app/services/slm/` and `app/models/` modules.
 - **UI Customization**: Modify or extend UI components in `app/ui/`.
 
 ---
